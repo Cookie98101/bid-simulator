@@ -1,0 +1,9 @@
+__pycache__/
+build/
+dist/
+*.spec
+*.pyc
+.DS_Store
+.venv/
+ReCo_geojson.json
+ReCo_geojson.json.zip
