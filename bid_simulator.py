@@ -12,6 +12,10 @@ from tkinter import messagebox, ttk
 from dataclasses import dataclass
 
 
+class SimulationCancelled(Exception):
+    """Raised when the user cancels an in-flight simulation."""
+
+
 @dataclass
 class ScenarioConfig:
     control_price: float
@@ -282,7 +286,10 @@ def sample_discount_for_scenario(config: ScenarioConfig, scenario: OpponentScena
 
 
 def simulate_candidate_under_scenario(
-    config: ScenarioConfig, my_discount: float, scenario: OpponentScenario
+    config: ScenarioConfig,
+    my_discount: float,
+    scenario: OpponentScenario,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, float]:
     wins = 0.0
     total_gap = 0.0
@@ -290,7 +297,9 @@ def simulate_candidate_under_scenario(
     total_crowding = 0.0
     my_bid = discount_to_bid(config.control_price, my_discount)
 
-    for _ in range(config.simulations):
+    for idx in range(config.simulations):
+        if cancel_event is not None and idx % 50 == 0 and cancel_event.is_set():
+            raise SimulationCancelled("用户已停止本次模拟。")
         competitor_count = sample_competitor_count(config)
         competitor_bids = [
             discount_to_bid(config.control_price, sample_discount_for_scenario(config, scenario))
@@ -321,10 +330,15 @@ def simulate_candidate_under_scenario(
     }
 
 
-def simulate_candidate(config: ScenarioConfig, my_discount: float) -> dict[str, float]:
+def simulate_candidate(
+    config: ScenarioConfig,
+    my_discount: float,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, float]:
     scenarios = build_opponent_scenarios(config)
     scenario_results = [
-        simulate_candidate_under_scenario(config, my_discount, scenario) for scenario in scenarios
+        simulate_candidate_under_scenario(config, my_discount, scenario, cancel_event)
+        for scenario in scenarios
     ]
     scenario_win_rates = {scenario.name: result["win_rate"] for scenario, result in zip(scenarios, scenario_results)}
     avg_win_rate = sum(item["win_rate"] for item in scenario_results) / len(scenario_results)
@@ -350,12 +364,34 @@ def simulate_candidate(config: ScenarioConfig, my_discount: float) -> dict[str, 
     }
 
 
-def run_simulation(config: ScenarioConfig) -> tuple[dict[str, float], list[dict[str, float]], list[float]]:
+def pick_best_by_scenario(results: list[dict[str, float]], scenario_names: list[str]) -> dict[str, dict[str, float]]:
+    best_by_scenario: dict[str, dict[str, float]] = {}
+    for scenario_name in scenario_names:
+        ranked = sorted(
+            results,
+            key=lambda item: (
+                -item["scenario_win_rates"][scenario_name],
+                item["avg_gap"],
+                item["discount"],
+            ),
+        )
+        best_by_scenario[scenario_name] = ranked[0]
+    return best_by_scenario
+
+
+def run_simulation(
+    config: ScenarioConfig,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[str, float], list[dict[str, float]], list[float], dict[str, dict[str, float]]]:
     if config.seed is not None:
         random.seed(config.seed)
 
     candidates = build_candidate_discounts(config)
-    results = [simulate_candidate(config, discount) for discount in candidates]
+    results: list[dict[str, float]] = []
+    for discount in candidates:
+        if cancel_event is not None and cancel_event.is_set():
+            raise SimulationCancelled("用户已停止本次模拟。")
+        results.append(simulate_candidate(config, discount, cancel_event))
     results.sort(
         key=lambda item: (
             -item["avg_win_rate"],
@@ -366,7 +402,9 @@ def run_simulation(config: ScenarioConfig) -> tuple[dict[str, float], list[dict[
             item["discount"],
         )
     )
-    return results[0], results, candidates
+    scenario_names = [scenario.name for scenario in build_opponent_scenarios(config)]
+    scenario_best = pick_best_by_scenario(results, scenario_names)
+    return results[0], results, candidates, scenario_best
 
 
 def format_pct(value: float) -> str:
@@ -379,7 +417,7 @@ def format_money(value: float) -> str:
 
 def main() -> None:
     config = parse_args()
-    best, results, candidates = run_simulation(config)
+    best, results, candidates, scenario_best = run_simulation(config)
 
     print("投标报价模拟器")
     print("=" * 32)
@@ -401,15 +439,21 @@ def main() -> None:
     print(f"Sample total count (11+): {config.large_sample_total_count}")
     print(f"Simulations per candidate: {config.simulations}")
     print()
-    print("Recommended result")
+    print("Overall robust recommendation")
     print(f"- Discount: {format_pct(best['discount'])}")
     print(f"- Bid price: {format_money(best['bid'])}")
     print(f"- Average win rate: {best['avg_win_rate']:.2%}")
     print(f"- Worst win rate: {best['worst_win_rate']:.2%}")
-    print(f"- Sensitivity: {best['win_rate_sensitivity']:.2%}")
-    print(f"- Crowding: {best['avg_crowding']:.2f}")
     print(f"- Average benchmark price: {format_money(best['avg_base_price'])}")
     print(f"- Scenarios: {' '.join(f'{k}:{v:.2%}' for k, v in best['scenario_win_rates'].items())}")
+    print()
+    print("Best quote for each scenario")
+    for name, item in scenario_best.items():
+        print(
+            f"- {name}: {format_pct(item['discount'])} | "
+            f"bid {format_money(item['bid'])} | "
+            f"win rate {item['scenario_win_rates'][name]:.2%}"
+        )
     print()
     print("Top 10 candidate discounts (robust ranking)")
     for idx, item in enumerate(results[:10], start=1):
@@ -417,8 +461,6 @@ def main() -> None:
             f"{idx:>2}. {format_pct(item['discount'])} | "
             f"avg {item['avg_win_rate']:.2%} | "
             f"worst {item['worst_win_rate']:.2%} | "
-            f"sen {item['win_rate_sensitivity']:.2%} | "
-            f"crowd {item['avg_crowding']:.2f} | "
             f"gap {format_money(item['avg_gap'])}"
         )
 
@@ -434,7 +476,9 @@ class BidSimulatorApp:
         self.status_var = tk.StringVar(value="请先填写参数，然后点击开始模拟。")
         self.summary_var = tk.StringVar(value="结果会显示在这里。")
         self.run_button: ttk.Button | None = None
+        self.stop_button: ttk.Button | None = None
         self.results_box: tk.Text | None = None
+        self.cancel_event = threading.Event()
 
         self._build_ui()
 
@@ -473,18 +517,36 @@ class BidSimulatorApp:
 
         form.columnconfigure(1, weight=1)
 
-        self.run_button = ttk.Button(form, text="开始模拟", command=self.on_run)
-        self.run_button.grid(row=len(fields), column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        button_row = ttk.Frame(form)
+        button_row.grid(row=len(fields), column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        button_row.columnconfigure(0, weight=1)
+        button_row.columnconfigure(1, weight=1)
+
+        self.run_button = ttk.Button(button_row, text="开始模拟", command=self.on_run)
+        self.run_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.stop_button = ttk.Button(
+            button_row, text="停止模拟", command=self.on_stop, state="disabled"
+        )
+        self.stop_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        ttk.Separator(form, orient="horizontal").grid(
+            row=len(fields) + 1, column=0, columnspan=2, sticky="ew", pady=(12, 8)
+        )
 
         ttk.Label(
             form,
             text=(
                 "规则：≤5家时全体直接算术平均乘随机A%；6-10家按表抽样后去最高最低再平均乘随机A%；"
-                "≥11家按两组等量抽样后去最高最低再平均乘随机A%。"
+                "≥11家按两组等量抽样后去最高最低再平均乘随机A%。\n"
+                "场景A：按我方原区间模拟对手报价。\n"
+                "场景B：对手整体比我方判断低0.03个百分点。\n"
+                "场景C：对手整体比我方判断高0.03个百分点。\n"
+                "场景D：对手报价区间更宽，波动更大。\n"
+                "场景E：对手大量集中在下浮上边界附近。"
             ),
             wraplength=300,
             justify="left",
-        ).grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ).grid(row=len(fields) + 2, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
         output = ttk.Frame(container)
         output.grid(row=0, column=1, sticky="nsew")
@@ -505,7 +567,7 @@ class BidSimulatorApp:
         self.results_box.grid(row=3, column=0, sticky="nsew")
         self.results_box.insert(
             "1.0",
-            "点击“开始模拟”后，这里会显示推荐下浮率、报价金额和前10名稳健候选结果。\n",
+            "点击“开始模拟”后，这里会显示总体稳健推荐、各场景单独最优报价和前10名稳健候选结果。\n",
         )
         self.results_box.configure(state="disabled")
 
@@ -548,44 +610,63 @@ class BidSimulatorApp:
             return
 
         assert self.run_button is not None
+        assert self.stop_button is not None
+        self.cancel_event = threading.Event()
         self.run_button.configure(state="disabled")
-        self.status_var.set("模拟中，请稍候...")
+        self.stop_button.configure(state="normal")
+        self.status_var.set("模拟中，请稍候。可点击“停止模拟”中断。")
         self.summary_var.set("正在运行模拟...")
         self._set_results("正在计算，请稍候...\n")
 
         threading.Thread(target=self._run_in_background, args=(config,), daemon=True).start()
 
+    def on_stop(self) -> None:
+        assert self.stop_button is not None
+        self.cancel_event.set()
+        self.stop_button.configure(state="disabled")
+        self.status_var.set("正在停止模拟，请稍候...")
+        self.summary_var.set("正在停止...")
+
     def _run_in_background(self, config: ScenarioConfig) -> None:
         try:
-            best, results, candidates = run_simulation(config)
+            best, results, candidates, scenario_best = run_simulation(config, self.cancel_event)
             scenario_text = " | ".join(
                 f"{k}:{v:.2%}" for k, v in best["scenario_win_rates"].items()
             )
             lines = [
-                f"推荐下浮率: {format_pct(best['discount'])}",
-                f"推荐报价: {format_money(best['bid'])}",
+                "【总体稳健推荐】",
+                f"下浮率: {format_pct(best['discount'])}",
+                f"报价: {format_money(best['bid'])}",
                 f"平均中标率: {best['avg_win_rate']:.2%}",
                 f"最差场景中标率: {best['worst_win_rate']:.2%}",
-                f"敏感度: {best['win_rate_sensitivity']:.2%}",
-                f"拥挤度: {best['avg_crowding']:.2f}",
                 f"平均基准价: {format_money(best['avg_base_price'])}",
                 f"场景结果: {scenario_text}",
                 "",
-                "前10名稳健候选报价",
+                "【各场景单独最优报价】",
             ]
+            for name, item in scenario_best.items():
+                lines.append(
+                    f"场景{name}: 下浮 {format_pct(item['discount'])} | "
+                    f"报价 {format_money(item['bid'])} | "
+                    f"中标率 {item['scenario_win_rates'][name]:.2%}"
+                )
+            lines.extend(
+                [
+                    "",
+                    "【前10名稳健候选报价】",
+                ]
+            )
             for idx, item in enumerate(results[:10], start=1):
                 lines.append(
                     f"{idx:>2}. 下浮 {format_pct(item['discount'])} | "
                     f"平均 {item['avg_win_rate']:.2%} | "
                     f"最差 {item['worst_win_rate']:.2%} | "
-                    f"敏感 {item['win_rate_sensitivity']:.2%} | "
-                    f"拥挤 {item['avg_crowding']:.2f} | "
                     f"偏差 {format_money(item['avg_gap'])}"
                 )
 
             summary = (
-                f"推荐下浮率 {format_pct(best['discount'])}，"
-                f"推荐报价 {format_money(best['bid'])}，"
+                f"总体稳健推荐下浮率 {format_pct(best['discount'])}，"
+                f"报价 {format_money(best['bid'])}，"
                 f"平均中标率 {best['avg_win_rate']:.2%}。"
             )
 
@@ -593,20 +674,35 @@ class BidSimulatorApp:
                 0,
                 lambda: self._finish_run(summary, "\n".join(lines)),
             )
+        except SimulationCancelled as exc:
+            self.root.after(0, lambda: self._cancel_run(str(exc)))
         except Exception as exc:  # pragma: no cover - UI fallback
             traceback.print_exc()
             self.root.after(0, lambda: self._fail_run(str(exc)))
 
     def _finish_run(self, summary: str, text: str) -> None:
         assert self.run_button is not None
+        assert self.stop_button is not None
         self.run_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
         self.status_var.set("模拟完成。")
         self.summary_var.set(summary)
         self._set_results(text)
 
+    def _cancel_run(self, message: str) -> None:
+        assert self.run_button is not None
+        assert self.stop_button is not None
+        self.run_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self.status_var.set("模拟已停止。")
+        self.summary_var.set("本次模拟已取消。")
+        self._set_results(f"{message}\n")
+
     def _fail_run(self, error: str) -> None:
         assert self.run_button is not None
+        assert self.stop_button is not None
         self.run_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
         self.status_var.set("模拟失败。")
         self.summary_var.set("模拟未完成。")
         self._set_results(f"出错了：{error}\n")
