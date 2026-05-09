@@ -21,8 +21,8 @@ class ScenarioConfig:
     competitor_min: int = 30
     competitor_typical_low: int = 35
     competitor_typical_high: int = 48
-    coeff_low: float = 0.95
-    coeff_high: float = 0.99
+    a_percent: float = 0.97
+    sample_total_count: int = 10
     simulations: int = 5000
     candidate_step: float = 0.0005
     candidate_padding: float = 0.003
@@ -76,16 +76,16 @@ def parse_args() -> ScenarioConfig:
         help="Typical upper bound for competitor count.",
     )
     parser.add_argument(
-        "--coeff-low",
+        "--a-percent",
         type=float,
-        default=0.95,
-        help="Random coefficient lower bound.",
+        default=97,
+        help="A percent value, e.g. 97 means A%=97%%.",
     )
     parser.add_argument(
-        "--coeff-high",
-        type=float,
-        default=0.99,
-        help="Random coefficient upper bound.",
+        "--sample-total-count",
+        type=int,
+        default=10,
+        help="Total sampled bidder count across two groups.",
     )
     parser.add_argument(
         "--simulations",
@@ -121,8 +121,8 @@ def parse_args() -> ScenarioConfig:
         competitor_min=args.competitor_min,
         competitor_typical_low=args.competitor_typical_low,
         competitor_typical_high=args.competitor_typical_high,
-        coeff_low=args.coeff_low,
-        coeff_high=args.coeff_high,
+        a_percent=args.a_percent / 100.0,
+        sample_total_count=args.sample_total_count,
         simulations=args.simulations,
         candidate_step=args.candidate_step / 100.0,
         candidate_padding=args.candidate_padding / 100.0,
@@ -159,14 +159,28 @@ def discount_to_bid(control_price: float, discount: float) -> float:
 def build_candidate_discounts(config: ScenarioConfig) -> list[float]:
     start = max(0.0, config.discount_low - config.candidate_padding)
     end = min(0.9999, config.discount_high + config.candidate_padding)
-    total_steps = int(round((end - start) / config.candidate_step))
-    return [start + i * config.candidate_step for i in range(total_steps + 1)]
+    candidates: list[float] = []
+    current = start
+    epsilon = config.candidate_step / 1000
+
+    while current <= end + epsilon:
+        candidates.append(min(current, end))
+        current += config.candidate_step
+
+    if not candidates or abs(candidates[-1] - end) > epsilon:
+        candidates.append(end)
+
+    unique_candidates: list[float] = []
+    for candidate in candidates:
+        if not unique_candidates or abs(unique_candidates[-1] - candidate) > epsilon:
+            unique_candidates.append(candidate)
+    return unique_candidates
 
 
-def compute_base_price(bids: list[float], coeff: float) -> float:
-    ordered = sorted(bids)
+def compute_base_price(sampled_bids: list[float], a_percent: float) -> float:
+    ordered = sorted(sampled_bids)
     trimmed = ordered[1:-1]
-    return sum(trimmed) / len(trimmed) * coeff
+    return sum(trimmed) / len(trimmed) * a_percent
 
 
 def winner_index(bids: list[float], base_price: float) -> int:
@@ -174,6 +188,28 @@ def winner_index(bids: list[float], base_price: float) -> int:
         range(len(bids)),
         key=lambda idx: (abs(bids[idx] - base_price), bids[idx]),
     )
+
+
+def sample_bids_for_benchmark(all_bids: list[float], sample_total_count: int) -> list[float]:
+    if sample_total_count < 4:
+        raise ValueError("抽样总人数至少需要 4，才能去掉一个最高价和一个最低价。")
+    if sample_total_count % 2 != 0:
+        raise ValueError("抽样总人数必须是偶数，才能分成两组相同数量。")
+    if sample_total_count > len(all_bids):
+        raise ValueError("抽样总人数不能大于有效报价总人数。")
+
+    indices = list(range(len(all_bids)))
+    random.shuffle(indices)
+    midpoint = len(indices) // 2
+    group_a = indices[:midpoint]
+    group_b = indices[midpoint:]
+    per_group = sample_total_count // 2
+
+    if len(group_a) < per_group or len(group_b) < per_group:
+        raise ValueError("当前有效报价人数不足以按两组等量抽样。")
+
+    sampled_indices = random.sample(group_a, per_group) + random.sample(group_b, per_group)
+    return [all_bids[idx] for idx in sampled_indices]
 
 
 def simulate_candidate(config: ScenarioConfig, my_discount: float) -> dict[str, float]:
@@ -189,8 +225,8 @@ def simulate_candidate(config: ScenarioConfig, my_discount: float) -> dict[str, 
             for _ in range(competitor_count)
         ]
         bids = competitor_bids + [my_bid]
-        coeff = random.uniform(config.coeff_low, config.coeff_high)
-        base_price = compute_base_price(bids, coeff)
+        sampled_bids = sample_bids_for_benchmark(bids, config.sample_total_count)
+        base_price = compute_base_price(sampled_bids, config.a_percent)
         win_idx = winner_index(bids, base_price)
         my_idx = len(bids) - 1
         if win_idx == my_idx:
@@ -244,9 +280,10 @@ def main() -> None:
         f"(typical {config.competitor_typical_low} - {config.competitor_typical_high})"
     )
     print(
-        "Random coefficient: "
-        f"{config.coeff_low:.2f} - {config.coeff_high:.2f}"
+        "Benchmark factor A%: "
+        f"{config.a_percent * 100:.2f}%"
     )
+    print(f"Sample total count: {config.sample_total_count}")
     print(f"Simulations per candidate: {config.simulations}")
     print()
     print("Recommended result")
@@ -298,8 +335,8 @@ class BidSimulatorApp:
             ("competitor_min", "保底竞争家数", "30"),
             ("competitor_typical_low", "常态竞争下界", "35"),
             ("competitor_typical_high", "常态竞争上界", "48"),
-            ("coeff_low", "随机系数下界", "0.95"),
-            ("coeff_high", "随机系数上界", "0.99"),
+            ("a_percent", "A值(%)", "97"),
+            ("sample_total_count", "抽样总人数", "10"),
             ("simulations", "每个报价模拟次数", "5000"),
             ("candidate_step", "搜索步长(百分点)", "0.05"),
             ("candidate_padding", "搜索扩展(百分点)", "0.3"),
@@ -322,8 +359,8 @@ class BidSimulatorApp:
         ttk.Label(
             form,
             text=(
-                "规则：剔除1个最高价和1个最低价，剩余报价取平均，"
-                "乘随机系数得到基准价，最接近基准价者中标。"
+                "规则：先分两组等量随机抽样，合并后剔除1个最高价和1个最低价，"
+                "剩余报价取平均，再乘A值得到基准价，最接近基准价者中标。"
             ),
             wraplength=300,
             justify="left",
@@ -367,8 +404,8 @@ class BidSimulatorApp:
                 competitor_min=int(self.inputs["competitor_min"].get()),
                 competitor_typical_low=int(self.inputs["competitor_typical_low"].get()),
                 competitor_typical_high=int(self.inputs["competitor_typical_high"].get()),
-                coeff_low=float(self.inputs["coeff_low"].get()),
-                coeff_high=float(self.inputs["coeff_high"].get()),
+                a_percent=float(self.inputs["a_percent"].get()) / 100.0,
+                sample_total_count=int(self.inputs["sample_total_count"].get()),
                 simulations=int(self.inputs["simulations"].get()),
                 candidate_step=float(self.inputs["candidate_step"].get()) / 100.0,
                 candidate_padding=float(self.inputs["candidate_padding"].get()) / 100.0,
