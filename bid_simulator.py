@@ -22,11 +22,30 @@ class ScenarioConfig:
     competitor_typical_low: int = 35
     competitor_typical_high: int = 48
     a_percent: float = 0.97
-    sample_total_count: int = 10
+    large_sample_total_count: int = 10
     simulations: int = 5000
     candidate_step: float = 0.0005
-    candidate_padding: float = 0.003
+    candidate_padding: float = 0.0
     seed: int | None = 42
+
+
+@dataclass(frozen=True)
+class OpponentScenario:
+    name: str
+    avg_shift_points: float = 0.0
+    low_shift_points: float = 0.0
+    high_shift_points: float = 0.0
+    mode: str = "normal"
+    spread_scale: float = 1.0
+
+
+SCENARIO_SHIFT_POINTS = 0.03
+SCENARIO_WIDE_POINTS = 0.03
+CROWDING_BAND_POINTS = 0.05
+
+
+def points_to_decimal(points: float) -> float:
+    return points / 100.0
 
 
 def parse_args() -> ScenarioConfig:
@@ -82,10 +101,10 @@ def parse_args() -> ScenarioConfig:
         help="A percent value, e.g. 97 means A%=97%%.",
     )
     parser.add_argument(
-        "--sample-total-count",
+        "--large-sample-total-count",
         type=int,
         default=10,
-        help="Total sampled bidder count across two groups.",
+        help="For 11+ bidders, total sampled bidder count across two groups.",
     )
     parser.add_argument(
         "--simulations",
@@ -102,7 +121,7 @@ def parse_args() -> ScenarioConfig:
     parser.add_argument(
         "--candidate-padding",
         type=float,
-        default=0.3,
+        default=0.0,
         help="Search outside the mainstream range by this many percentage points.",
     )
     parser.add_argument(
@@ -122,7 +141,7 @@ def parse_args() -> ScenarioConfig:
         competitor_typical_low=args.competitor_typical_low,
         competitor_typical_high=args.competitor_typical_high,
         a_percent=args.a_percent / 100.0,
-        sample_total_count=args.sample_total_count,
+        large_sample_total_count=args.large_sample_total_count,
         simulations=args.simulations,
         candidate_step=args.candidate_step / 100.0,
         candidate_padding=args.candidate_padding / 100.0,
@@ -177,70 +196,159 @@ def build_candidate_discounts(config: ScenarioConfig) -> list[float]:
     return unique_candidates
 
 
-def compute_base_price(sampled_bids: list[float], a_percent: float) -> float:
+def compute_base_price(sampled_bids: list[float], a_percent: float, trim_extremes: bool) -> float:
     ordered = sorted(sampled_bids)
-    trimmed = ordered[1:-1]
-    return sum(trimmed) / len(trimmed) * a_percent
+    if trim_extremes:
+        ordered = ordered[1:-1]
+    return sum(ordered) / len(ordered) * a_percent
 
 
-def winner_index(bids: list[float], base_price: float) -> int:
-    return min(
-        range(len(bids)),
-        key=lambda idx: (abs(bids[idx] - base_price), bids[idx]),
-    )
-
-
-def sample_bids_for_benchmark(all_bids: list[float], sample_total_count: int) -> list[float]:
-    if sample_total_count < 4:
-        raise ValueError("抽样总人数至少需要 4，才能去掉一个最高价和一个最低价。")
-    if sample_total_count % 2 != 0:
-        raise ValueError("抽样总人数必须是偶数，才能分成两组相同数量。")
-    if sample_total_count > len(all_bids):
-        raise ValueError("抽样总人数不能大于有效报价总人数。")
-
+def split_groups(all_bids: list[float]) -> tuple[list[float], list[float]]:
     indices = list(range(len(all_bids)))
     random.shuffle(indices)
     midpoint = len(indices) // 2
-    group_a = indices[:midpoint]
-    group_b = indices[midpoint:]
-    per_group = sample_total_count // 2
-
-    if len(group_a) < per_group or len(group_b) < per_group:
-        raise ValueError("当前有效报价人数不足以按两组等量抽样。")
-
-    sampled_indices = random.sample(group_a, per_group) + random.sample(group_b, per_group)
-    return [all_bids[idx] for idx in sampled_indices]
+    left = [all_bids[idx] for idx in indices[:midpoint]]
+    right = [all_bids[idx] for idx in indices[midpoint:]]
+    return left, right
 
 
-def simulate_candidate(config: ScenarioConfig, my_discount: float) -> dict[str, float]:
-    wins = 0
+def benchmark_sample_rule(total_bidders: int, config: ScenarioConfig) -> tuple[str, int]:
+    if total_bidders <= 5:
+        return "all", total_bidders
+    if total_bidders == 6:
+        return "fixed", 3
+    if total_bidders == 7:
+        return "fixed", 3
+    if total_bidders == 8:
+        return "fixed", 3
+    if total_bidders == 9:
+        return "fixed", 4
+    if total_bidders == 10:
+        return "fixed", 4
+    if config.large_sample_total_count < 10 or config.large_sample_total_count % 2 != 0:
+        raise ValueError("≥11家的抽样总人数必须是偶数且不小于10。")
+    per_group = config.large_sample_total_count // 2
+    return "fixed_large", per_group
+
+
+def sample_bids_for_benchmark(all_bids: list[float], config: ScenarioConfig) -> tuple[list[float], bool]:
+    total_bidders = len(all_bids)
+    rule, sample_num = benchmark_sample_rule(total_bidders, config)
+    if rule == "all":
+        return all_bids[:], False
+
+    left_group, right_group = split_groups(all_bids)
+    per_group = sample_num
+
+    if rule == "fixed_large":
+        per_group = min(per_group, len(left_group), len(right_group))
+
+    if per_group <= 0:
+        raise ValueError("抽样人数不足。")
+
+    sampled = random.sample(left_group, min(per_group, len(left_group))) + random.sample(
+        right_group, min(per_group, len(right_group))
+    )
+    return sampled, True
+
+
+def build_opponent_scenarios(config: ScenarioConfig) -> list[OpponentScenario]:
+    shift = points_to_decimal(SCENARIO_SHIFT_POINTS)
+    wide = points_to_decimal(SCENARIO_WIDE_POINTS)
+    return [
+        OpponentScenario(name="A", mode="normal"),
+        OpponentScenario(name="B", avg_shift_points=-shift, low_shift_points=-shift, high_shift_points=-shift, mode="normal"),
+        OpponentScenario(name="C", avg_shift_points=shift, low_shift_points=shift, high_shift_points=shift, mode="normal"),
+        OpponentScenario(
+            name="D",
+            low_shift_points=-wide,
+            high_shift_points=wide,
+            mode="normal",
+            spread_scale=1.4,
+        ),
+        OpponentScenario(name="E", mode="upper_cluster", spread_scale=1.0),
+    ]
+
+
+def sample_discount_for_scenario(config: ScenarioConfig, scenario: OpponentScenario) -> float:
+    low = clamp(config.discount_low + scenario.low_shift_points, 0.0, 0.9999)
+    high = clamp(config.discount_high + scenario.high_shift_points, low + 1e-6, 0.9999)
+    avg = clamp(config.avg_discount + scenario.avg_shift_points, low, high)
+    span = max(high - low, 1e-6)
+
+    if scenario.mode == "upper_cluster":
+        raw = low + span * random.betavariate(8.0, 2.0)
+    else:
+        sigma = max((span / 6.0) * scenario.spread_scale, 1e-6)
+        raw = random.gauss(avg, sigma)
+    return clamp(raw, low, high)
+
+
+def simulate_candidate_under_scenario(
+    config: ScenarioConfig, my_discount: float, scenario: OpponentScenario
+) -> dict[str, float]:
+    wins = 0.0
     total_gap = 0.0
     total_base_price = 0.0
+    total_crowding = 0.0
     my_bid = discount_to_bid(config.control_price, my_discount)
 
     for _ in range(config.simulations):
         competitor_count = sample_competitor_count(config)
         competitor_bids = [
-            discount_to_bid(config.control_price, sample_discount(config))
+            discount_to_bid(config.control_price, sample_discount_for_scenario(config, scenario))
             for _ in range(competitor_count)
         ]
         bids = competitor_bids + [my_bid]
-        sampled_bids = sample_bids_for_benchmark(bids, config.sample_total_count)
-        base_price = compute_base_price(sampled_bids, config.a_percent)
-        win_idx = winner_index(bids, base_price)
+        sampled_bids, trim_extremes = sample_bids_for_benchmark(bids, config)
+        base_price = compute_base_price(sampled_bids, config.a_percent, trim_extremes)
+        gaps = [abs(bid - base_price) for bid in bids]
+        best_gap = min(gaps)
+        tied_winners = [idx for idx, gap in enumerate(gaps) if abs(gap - best_gap) <= 1e-9]
         my_idx = len(bids) - 1
-        if win_idx == my_idx:
-            wins += 1
+        if my_idx in tied_winners:
+            wins += 1.0 / len(tied_winners)
         total_gap += abs(my_bid - base_price)
         total_base_price += base_price
+        crowd_band = max(config.candidate_step * 1.5, points_to_decimal(CROWDING_BAND_POINTS))
+        total_crowding += sum(1 for bid in competitor_bids if abs(bid - my_bid) <= crowd_band)
 
     return {
         "discount": my_discount,
         "bid": my_bid,
         "win_rate": wins / config.simulations,
-        "wins": wins,
         "avg_gap": total_gap / config.simulations,
         "avg_base_price": total_base_price / config.simulations,
+        "crowding": total_crowding / config.simulations,
+    }
+
+
+def simulate_candidate(config: ScenarioConfig, my_discount: float) -> dict[str, float]:
+    scenarios = build_opponent_scenarios(config)
+    scenario_results = [
+        simulate_candidate_under_scenario(config, my_discount, scenario) for scenario in scenarios
+    ]
+    scenario_win_rates = {scenario.name: result["win_rate"] for scenario, result in zip(scenarios, scenario_results)}
+    avg_win_rate = sum(item["win_rate"] for item in scenario_results) / len(scenario_results)
+    worst_win_rate = min(item["win_rate"] for item in scenario_results)
+    win_rate_sensitivity = max(item["win_rate"] for item in scenario_results) - worst_win_rate
+    avg_gap = sum(item["avg_gap"] for item in scenario_results) / len(scenario_results)
+    avg_crowding = sum(item["crowding"] for item in scenario_results) / len(scenario_results)
+    avg_base_price = sum(item["avg_base_price"] for item in scenario_results) / len(scenario_results)
+    robust_score = avg_win_rate - 0.5 * win_rate_sensitivity - 0.02 * avg_crowding
+
+    return {
+        "discount": my_discount,
+        "bid": discount_to_bid(config.control_price, my_discount),
+        "win_rate": avg_win_rate,
+        "avg_win_rate": avg_win_rate,
+        "worst_win_rate": worst_win_rate,
+        "win_rate_sensitivity": win_rate_sensitivity,
+        "avg_gap": avg_gap,
+        "avg_base_price": avg_base_price,
+        "avg_crowding": avg_crowding,
+        "robust_score": robust_score,
+        "scenario_win_rates": scenario_win_rates,
     }
 
 
@@ -250,7 +358,16 @@ def run_simulation(config: ScenarioConfig) -> tuple[dict[str, float], list[dict[
 
     candidates = build_candidate_discounts(config)
     results = [simulate_candidate(config, discount) for discount in candidates]
-    results.sort(key=lambda item: (-item["win_rate"], item["avg_gap"], item["discount"]))
+    results.sort(
+        key=lambda item: (
+            -item["avg_win_rate"],
+            -item["worst_win_rate"],
+            item["win_rate_sensitivity"],
+            item["avg_crowding"],
+            item["avg_gap"],
+            item["discount"],
+        )
+    )
     return results[0], results, candidates
 
 
@@ -283,22 +400,28 @@ def main() -> None:
         "Benchmark factor A%: "
         f"{config.a_percent * 100:.2f}%"
     )
-    print(f"Sample total count: {config.sample_total_count}")
+    print(f"Sample total count (11+): {config.large_sample_total_count}")
     print(f"Simulations per candidate: {config.simulations}")
     print()
     print("Recommended result")
     print(f"- Discount: {format_pct(best['discount'])}")
     print(f"- Bid price: {format_money(best['bid'])}")
-    print(f"- Simulated win rate: {best['win_rate']:.2%}")
+    print(f"- Average win rate: {best['avg_win_rate']:.2%}")
+    print(f"- Worst win rate: {best['worst_win_rate']:.2%}")
+    print(f"- Sensitivity: {best['win_rate_sensitivity']:.2%}")
+    print(f"- Crowding: {best['avg_crowding']:.2f}")
     print(f"- Average benchmark price: {format_money(best['avg_base_price'])}")
+    print(f"- Scenarios: {' '.join(f'{k}:{v:.2%}' for k, v in best['scenario_win_rates'].items())}")
     print()
-    print("Top 10 candidate discounts")
+    print("Top 10 candidate discounts (robust ranking)")
     for idx, item in enumerate(results[:10], start=1):
         print(
             f"{idx:>2}. {format_pct(item['discount'])} | "
-            f"bid {format_money(item['bid'])} | "
-            f"win rate {item['win_rate']:.2%} | "
-            f"avg gap {format_money(item['avg_gap'])}"
+            f"avg {item['avg_win_rate']:.2%} | "
+            f"worst {item['worst_win_rate']:.2%} | "
+            f"sen {item['win_rate_sensitivity']:.2%} | "
+            f"crowd {item['avg_crowding']:.2f} | "
+            f"gap {format_money(item['avg_gap'])}"
         )
 
 
@@ -336,10 +459,10 @@ class BidSimulatorApp:
             ("competitor_typical_low", "常态竞争下界", "35"),
             ("competitor_typical_high", "常态竞争上界", "48"),
             ("a_percent", "A值(%)", "97"),
-            ("sample_total_count", "抽样总人数", "10"),
+            ("large_sample_total_count", "≥11家抽样总人数", "10"),
             ("simulations", "每个报价模拟次数", "5000"),
             ("candidate_step", "搜索步长(百分点)", "0.05"),
-            ("candidate_padding", "搜索扩展(百分点)", "0.3"),
+            ("candidate_padding", "搜索扩展(百分点)", "0"),
             ("seed", "随机种子", "42"),
         ]
 
@@ -359,8 +482,8 @@ class BidSimulatorApp:
         ttk.Label(
             form,
             text=(
-                "规则：先分两组等量随机抽样，合并后剔除1个最高价和1个最低价，"
-                "剩余报价取平均，再乘A值得到基准价，最接近基准价者中标。"
+                "规则：≤5家时全体直接算术平均乘A%；6-10家按表抽样后去最高最低再平均乘A%；"
+                "≥11家按两组等量抽样后去最高最低再平均乘A%。"
             ),
             wraplength=300,
             justify="left",
@@ -385,7 +508,7 @@ class BidSimulatorApp:
         self.results_box.grid(row=3, column=0, sticky="nsew")
         self.results_box.insert(
             "1.0",
-            "点击“开始模拟”后，这里会显示推荐下浮率、报价金额和前10名候选结果。\n",
+            "点击“开始模拟”后，这里会显示推荐下浮率、报价金额和前10名稳健候选结果。\n",
         )
         self.results_box.configure(state="disabled")
 
@@ -405,7 +528,7 @@ class BidSimulatorApp:
                 competitor_typical_low=int(self.inputs["competitor_typical_low"].get()),
                 competitor_typical_high=int(self.inputs["competitor_typical_high"].get()),
                 a_percent=float(self.inputs["a_percent"].get()) / 100.0,
-                sample_total_count=int(self.inputs["sample_total_count"].get()),
+                large_sample_total_count=int(self.inputs["large_sample_total_count"].get()),
                 simulations=int(self.inputs["simulations"].get()),
                 candidate_step=float(self.inputs["candidate_step"].get()) / 100.0,
                 candidate_padding=float(self.inputs["candidate_padding"].get()) / 100.0,
@@ -439,26 +562,35 @@ class BidSimulatorApp:
     def _run_in_background(self, config: ScenarioConfig) -> None:
         try:
             best, results, candidates = run_simulation(config)
+            scenario_text = " | ".join(
+                f"{k}:{v:.2%}" for k, v in best["scenario_win_rates"].items()
+            )
             lines = [
                 f"推荐下浮率: {format_pct(best['discount'])}",
                 f"推荐报价: {format_money(best['bid'])}",
-                f"模拟中标率: {best['win_rate']:.2%}",
+                f"平均中标率: {best['avg_win_rate']:.2%}",
+                f"最差场景中标率: {best['worst_win_rate']:.2%}",
+                f"敏感度: {best['win_rate_sensitivity']:.2%}",
+                f"拥挤度: {best['avg_crowding']:.2f}",
                 f"平均基准价: {format_money(best['avg_base_price'])}",
+                f"场景结果: {scenario_text}",
                 "",
-                "前10名候选报价",
+                "前10名稳健候选报价",
             ]
             for idx, item in enumerate(results[:10], start=1):
                 lines.append(
                     f"{idx:>2}. 下浮 {format_pct(item['discount'])} | "
-                    f"报价 {format_money(item['bid'])} | "
-                    f"中标率 {item['win_rate']:.2%} | "
-                    f"平均偏差 {format_money(item['avg_gap'])}"
+                    f"平均 {item['avg_win_rate']:.2%} | "
+                    f"最差 {item['worst_win_rate']:.2%} | "
+                    f"敏感 {item['win_rate_sensitivity']:.2%} | "
+                    f"拥挤 {item['avg_crowding']:.2f} | "
+                    f"偏差 {format_money(item['avg_gap'])}"
                 )
 
             summary = (
                 f"推荐下浮率 {format_pct(best['discount'])}，"
                 f"推荐报价 {format_money(best['bid'])}，"
-                f"模拟中标率 {best['win_rate']:.2%}。"
+                f"平均中标率 {best['avg_win_rate']:.2%}。"
             )
 
             self.root.after(
