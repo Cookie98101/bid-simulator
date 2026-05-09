@@ -21,7 +21,6 @@ class ScenarioConfig:
     competitor_min: int = 30
     competitor_typical_low: int = 35
     competitor_typical_high: int = 48
-    a_percent: float = 0.97
     large_sample_total_count: int = 10
     simulations: int = 5000
     candidate_step: float = 0.0005
@@ -42,6 +41,7 @@ class OpponentScenario:
 SCENARIO_SHIFT_POINTS = 0.03
 SCENARIO_WIDE_POINTS = 0.03
 CROWDING_BAND_POINTS = 0.05
+A_PERCENT_CHOICES = [0.95, 0.96, 0.97, 0.98, 0.99]
 
 
 def points_to_decimal(points: float) -> float:
@@ -95,12 +95,6 @@ def parse_args() -> ScenarioConfig:
         help="Typical upper bound for competitor count.",
     )
     parser.add_argument(
-        "--a-percent",
-        type=float,
-        default=97,
-        help="A percent value, e.g. 97 means A%=97%%.",
-    )
-    parser.add_argument(
         "--large-sample-total-count",
         type=int,
         default=10,
@@ -140,7 +134,6 @@ def parse_args() -> ScenarioConfig:
         competitor_min=args.competitor_min,
         competitor_typical_low=args.competitor_typical_low,
         competitor_typical_high=args.competitor_typical_high,
-        a_percent=args.a_percent / 100.0,
         large_sample_total_count=args.large_sample_total_count,
         simulations=args.simulations,
         candidate_step=args.candidate_step / 100.0,
@@ -194,6 +187,10 @@ def build_candidate_discounts(config: ScenarioConfig) -> list[float]:
         if not unique_candidates or abs(unique_candidates[-1] - candidate) > epsilon:
             unique_candidates.append(candidate)
     return unique_candidates
+
+
+def sample_a_percent() -> float:
+    return random.choice(A_PERCENT_CHOICES)
 
 
 def compute_base_price(sampled_bids: list[float], a_percent: float, trim_extremes: bool) -> float:
@@ -301,7 +298,8 @@ def simulate_candidate_under_scenario(
         ]
         bids = competitor_bids + [my_bid]
         sampled_bids, trim_extremes = sample_bids_for_benchmark(bids, config)
-        base_price = compute_base_price(sampled_bids, config.a_percent, trim_extremes)
+        a_percent = sample_a_percent()
+        base_price = compute_base_price(sampled_bids, a_percent, trim_extremes)
         gaps = [abs(bid - base_price) for bid in bids]
         best_gap = min(gaps)
         tied_winners = [idx for idx, gap in enumerate(gaps) if abs(gap - best_gap) <= 1e-9]
@@ -398,7 +396,7 @@ def main() -> None:
     )
     print(
         "Benchmark factor A%: "
-        f"{config.a_percent * 100:.2f}%"
+        "random from 95%/96%/97%/98%/99%"
     )
     print(f"Sample total count (11+): {config.large_sample_total_count}")
     print(f"Simulations per candidate: {config.simulations}")
@@ -458,7 +456,6 @@ class BidSimulatorApp:
             ("competitor_min", "保底竞争家数", "30"),
             ("competitor_typical_low", "常态竞争下界", "35"),
             ("competitor_typical_high", "常态竞争上界", "48"),
-            ("a_percent", "A值(%)", "97"),
             ("large_sample_total_count", "≥11家抽样总人数", "10"),
             ("simulations", "每个报价模拟次数", "5000"),
             ("candidate_step", "搜索步长(百分点)", "0.05"),
@@ -482,8 +479,8 @@ class BidSimulatorApp:
         ttk.Label(
             form,
             text=(
-                "规则：≤5家时全体直接算术平均乘A%；6-10家按表抽样后去最高最低再平均乘A%；"
-                "≥11家按两组等量抽样后去最高最低再平均乘A%。"
+                "规则：≤5家时全体直接算术平均乘随机A%；6-10家按表抽样后去最高最低再平均乘随机A%；"
+                "≥11家按两组等量抽样后去最高最低再平均乘随机A%。"
             ),
             wraplength=300,
             justify="left",
@@ -527,7 +524,6 @@ class BidSimulatorApp:
                 competitor_min=int(self.inputs["competitor_min"].get()),
                 competitor_typical_low=int(self.inputs["competitor_typical_low"].get()),
                 competitor_typical_high=int(self.inputs["competitor_typical_high"].get()),
-                a_percent=float(self.inputs["a_percent"].get()) / 100.0,
                 large_sample_total_count=int(self.inputs["large_sample_total_count"].get()),
                 simulations=int(self.inputs["simulations"].get()),
                 candidate_step=float(self.inputs["candidate_step"].get()) / 100.0,
