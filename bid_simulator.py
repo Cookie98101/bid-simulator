@@ -478,6 +478,7 @@ class BidSimulatorApp:
         self.run_button: ttk.Button | None = None
         self.stop_button: ttk.Button | None = None
         self.results_box: tk.Text | None = None
+        self.results_scrollbar: ttk.Scrollbar | None = None
         self.cancel_event = threading.Event()
 
         self._build_ui()
@@ -563,12 +564,24 @@ class BidSimulatorApp:
             output, text="", wraplength=760, justify="left"
         ).grid(row=2, column=0, sticky="nw", pady=(0, 8))
 
-        self.results_box = tk.Text(output, wrap="word", font=("Menlo", 12))
-        self.results_box.grid(row=3, column=0, sticky="nsew")
+        results_frame = ttk.Frame(output)
+        results_frame.grid(row=3, column=0, sticky="nsew")
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
+
+        self.results_box = tk.Text(results_frame, wrap="word", font=("Menlo", 12))
+        self.results_box.grid(row=0, column=0, sticky="nsew")
+        self.results_scrollbar = ttk.Scrollbar(
+            results_frame, orient="vertical", command=self.results_box.yview
+        )
+        self.results_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.results_box.configure(yscrollcommand=self.results_scrollbar.set)
         self.results_box.insert(
             "1.0",
             "点击“开始模拟”后，这里会显示总体稳健推荐、各场景单独最优报价和前10名稳健候选结果。\n",
         )
+        self.results_box.bind("<Enter>", self._bind_results_mousewheel)
+        self.results_box.bind("<Leave>", self._unbind_results_mousewheel)
         self.results_box.configure(state="disabled")
 
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w")
@@ -601,6 +614,34 @@ class BidSimulatorApp:
         self.results_box.delete("1.0", "end")
         self.results_box.insert("1.0", text)
         self.results_box.configure(state="disabled")
+
+    def _bind_results_mousewheel(self, _event: tk.Event) -> None:
+        assert self.results_box is not None
+        self.results_box.bind_all("<MouseWheel>", self._on_results_mousewheel)
+        self.results_box.bind_all("<Button-4>", self._on_results_mousewheel)
+        self.results_box.bind_all("<Button-5>", self._on_results_mousewheel)
+
+    def _unbind_results_mousewheel(self, _event: tk.Event) -> None:
+        assert self.results_box is not None
+        self.results_box.unbind_all("<MouseWheel>")
+        self.results_box.unbind_all("<Button-4>")
+        self.results_box.unbind_all("<Button-5>")
+
+    def _on_results_mousewheel(self, event: tk.Event) -> str:
+        assert self.results_box is not None
+        if getattr(event, "num", None) == 4:
+            self.results_box.yview_scroll(-1, "units")
+            return "break"
+        if getattr(event, "num", None) == 5:
+            self.results_box.yview_scroll(1, "units")
+            return "break"
+
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return "break"
+        step = -1 if delta > 0 else 1
+        self.results_box.yview_scroll(step, "units")
+        return "break"
 
     def on_run(self) -> None:
         try:
