@@ -19,20 +19,62 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install PyInstaller
-        run: python -m pip install --upgrade pip pyinstaller
+      - name: Install Build Dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install `
+            pyinstaller `
+            playwright `
+            pillow `
+            numpy `
+            opencv-python-headless `
+            scikit-learn
 
-      - name: Build EXE
-        run: >
-          pyinstaller
-          --noconfirm
-          --onefile
-          --windowed
-          --name bid_simulator
-          bid_simulator.py
+      - name: Install Playwright Browsers
+        shell: pwsh
+        run: |
+          python -m playwright install chromium msedge
 
-      - name: Upload Artifact
+      - name: Build Bid Simulator EXE
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --onefile `
+            --windowed `
+            --name bid_simulator `
+            bid_simulator.py
+
+      - name: Build Jianyu Desktop EXE
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --onedir `
+            --windowed `
+            --name jianyu_desktop `
+            --collect-all playwright `
+            --collect-all PIL `
+            --collect-all cv2 `
+            --hidden-import sklearn `
+            --hidden-import sklearn.cluster `
+            --hidden-import numpy `
+            jianyu_desktop.py
+
+      - name: Package Jianyu Desktop Folder
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/jianyu_desktop/* -DestinationPath dist/jianyu_desktop_windows.zip -Force
+
+      - name: Upload Bid Simulator Artifact
         uses: actions/upload-artifact@v4
         with:
           name: bid-simulator-windows
           path: dist/bid_simulator.exe
+
+      - name: Upload Jianyu Desktop Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jianyu-desktop-windows
+          path: dist/jianyu_desktop_windows.zip
