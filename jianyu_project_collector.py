@@ -38,6 +38,9 @@ import numpy as np
 import cv2
 from sklearn.cluster import KMeans
 from playwright.sync_api import sync_playwright
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.asymmetric import padding
 
 
 SEARCH_URL = "https://www.jianyu360.cn/jyapi/jybx/core/fType/searchList"
@@ -48,6 +51,23 @@ DETAIL_URL_PREFIXES = (
     "https://www.jianyu360.cn",
     "https://xizang.jianyu360.cn",
 )
+JIANYU_DECRYPT_PRIVATE_KEY = """
+-----BEGIN PRIVATE KEY-----
+MIICdwIBADANBgkqhkiG9w0BAQEFAASCAmEwggJdAgEAAoGBAOhM0pNOfGeiBr+t
+nunphCHReY3RiS4Fuc2nD3cbjKNdLezeViGmsZwHsb2SVUb6rpPHyX0+3xjXYn//
+n39/Q8uPjWRA332TtN8MDEkSR2HMbn8ufRRt2TnlfsFDFTgBywSP7cwd0CiEdvBX
+5w8Jifc9VbedwbeplBWyDeLLqjRjAgMBAAECgYB4es+EAuLWxNwHMb8Hxkr3VzNZ
+8GDbc7DIDmsg9TLdz4fwH+hAD7pyGDOBBJIh/AXrM2U3BhKjSaIWjLdmYtT/kzg8
+BxQDr9YoO7u2jvTcEE+/6p2YugYX/ngpinawFJqyM+N7Or8yRABaw6Aq8VuKtv6p980Y2BBVVYn+/KorYQJBAP+9lu8iolzKRzJrFt/rosdWkOpNg5ujcSCwbxhYnYC0
+UY85sPLsMvnLgegkpO8jocSAt586BmcsA+Q9o97qVCkCQQDoiSVegtOvG3U0mNlN
+rCVpPEL22s9Kkwps3ZCdTl3VtUtNiyfhE8rbw/qOGti3VxMCRhpKi9hTIgeq13UG
+67WrAkEA/WQ1c5XGd9f4eU1AKffInmf4SB8rgn+L7I7EVMQgstB3a0kHOXqs+3IX
+shL01PliJFhBF+QfSgSDipdEke9uGQJBAOcw46xxmhDw1bizdulYi+Fy/oj7xzi3
+tJfEObGMZpLBKtsvzThkOz4APS3n1yuBMO8Dz8PqAeu1W7YpfLqiwv0CQF68N244
+dFebDSoZLl1hbCExpbtC7SDBpYxlIVNVqwN7ymr+Z0rIcAMVv5Ldp/bJEWaXJs9C
+0sPCBpjDnyK9Z04=
+-----END PRIVATE KEY-----
+""".strip()
 PLAYWRIGHT_EXECUTABLE_CANDIDATES = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 ]
@@ -879,7 +899,11 @@ def handle_manual_captcha(payload: dict[str, Any]) -> bool:
     emit_progress("captcha_manual_required", **payload)
     if MANUAL_CAPTCHA_HANDLER is None:
         raise ManualCaptchaRequired(payload)
-    ok = bool(MANUAL_CAPTCHA_HANDLER(payload))
+    ok = False
+    try:
+        ok = bool(MANUAL_CAPTCHA_HANDLER(payload))
+    except Exception:
+        ok = False
     if ok:
         emit_progress("captcha_manual_resolved", **payload)
         return True
@@ -1401,7 +1425,7 @@ def auto_attempt_html_captcha(url: str, cookie: str, config: SearchConfig) -> di
 
 def parse_args() -> SearchConfig:
     parser = argparse.ArgumentParser(description="Collect Jianyu360 search results.")
-    parser.add_argument("--keywords", default="房建")
+    parser.add_argument("--keywords", default="")
     parser.add_argument("--province", default="西藏")
     parser.add_argument("--industry", default="建筑工程")
     parser.add_argument("--publish-range", default="")
@@ -1488,12 +1512,104 @@ def load_cookie(config: SearchConfig, required: bool = True) -> str:
     return ""
 
 
+def ensure_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {"__raw_text__": text}
+    return {"__raw_text__": str(value or "")}
+
+
+def ensure_search_payload(value: Any) -> dict[str, Any]:
+    payload = ensure_json_object(value)
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return payload
+    if data is None:
+        payload["data"] = {}
+        return payload
+    payload["data"] = {"__raw_value__": data}
+    return payload
+
+
+def _normalize_jianyu_private_key_text(raw: str) -> str:
+    body = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("-----BEGIN") or line.startswith("-----END"):
+            continue
+        body.append(line)
+    if not body:
+        return raw.strip()
+    normalized = "".join(body)
+    return "-----BEGIN PRIVATE KEY-----\n" + "\n".join(normalized[i:i+64] for i in range(0, len(normalized), 64)) + "\n-----END PRIVATE KEY-----\n"
+
+
+def _load_jianyu_private_key():
+    pem = _normalize_jianyu_private_key_text(JIANYU_DECRYPT_PRIVATE_KEY)
+    return serialization.load_pem_private_key(
+        pem.encode("utf-8"),
+        password=None,
+    )
+
+
+def decrypt_jianyu_response(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("antiEncrypt") != 1:
+        return payload
+    encrypted_data = str(payload.get("data") or "")
+    encrypted_key = str(payload.get("secretKey") or "")
+    if not encrypted_data or not encrypted_key:
+        return payload
+    private_key = _load_jianyu_private_key()
+    aes_key = private_key.decrypt(
+        base64.b64decode(encrypted_key),
+        padding.PKCS1v15(),
+    )
+    if len(aes_key) not in (16, 24, 32):
+        raise ValueError(f"Unexpected AES key length: {len(aes_key)}")
+    raw = base64.b64decode(encrypted_data)
+    if len(raw) <= 16:
+        raise ValueError("Invalid Jianyu encrypted payload.")
+    iv, ciphertext = raw[:16], raw[16:]
+    if len(ciphertext) % 16 != 0:
+        raise ValueError(f"Invalid ciphertext length: {len(ciphertext)}")
+    decryptor = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    plaintext = plaintext.rstrip(b"\x00")
+    text = plaintext.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise ValueError("Empty decrypted Jianyu payload.")
+    decoded = json.loads(text)
+    if isinstance(decoded, dict):
+        return decoded
+    return {"data": decoded}
+
+
 def post_json(url: str, payload: dict[str, Any], cookie: str) -> dict[str, Any]:
     abort_if_requested()
     apply_search_rate_limit()
     browser_result = browser_request("POST", url, payload, {"content-type": "application/json"}, "json")
     if isinstance(browser_result, dict):
-        return browser_result
+        try:
+            return decrypt_jianyu_response(browser_result)
+        except Exception as exc:
+            browser_result = {**browser_result, "__decrypt_error__": str(exc)}
+            return browser_result
+    if isinstance(browser_result, str):
+        parsed = ensure_json_object(browser_result)
+        if parsed and parsed.keys() != {"__raw_text__"}:
+            try:
+                return decrypt_jianyu_response(parsed)
+            except Exception as exc:
+                parsed = {**parsed, "__decrypt_error__": str(exc)}
+                return parsed
     cookie = resolve_cookie(cookie)
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -1508,7 +1624,11 @@ def post_json(url: str, payload: dict[str, Any], cookie: str) -> dict[str, Any]:
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8", errors="replace"))
+        parsed = ensure_json_object(response.read().decode("utf-8", errors="replace"))
+        try:
+            return decrypt_jianyu_response(parsed)
+        except Exception:
+            return parsed
 
 
 def post_form(url: str, payload: dict[str, Any], cookie: str, extra_headers: dict[str, str] | None = None) -> str:
@@ -2073,6 +2193,15 @@ def split_keywords(raw: str) -> list[str]:
     return [part for part in re.split(r"[\s,，;；/]+", raw.strip()) if part]
 
 
+def expand_search_queries(raw: str) -> list[str]:
+    parts = split_keywords(raw)
+    if not parts:
+        return [""]
+    if len(parts) == 1:
+        return [parts[0]]
+    return parts
+
+
 def matches_keywords(item: dict[str, Any], keywords: str) -> bool:
     if not keywords.strip():
         return True
@@ -2083,7 +2212,7 @@ def matches_keywords(item: dict[str, Any], keywords: str) -> bool:
     parts = split_keywords(keywords)
     if not parts:
         return True
-    return all(part in haystack for part in parts)
+    return any(part in haystack for part in parts)
 
 
 def first_present(item: dict[str, Any], aliases: tuple[str, ...]) -> Any:
@@ -2919,14 +3048,18 @@ def enrich_record_with_detail(record: dict[str, Any], cookie: str) -> dict[str, 
     if is_captcha_html(html_text):
         register_detail_captcha_hit()
         LAST_FETCH_META["anti_verify"] = True
-        if handle_manual_captcha(
-            {
-                "scope": "detail_html",
-                "url": url,
-                "title": str(record.get("title") or record.get("project_name") or ""),
-                "message": "详情页触发验证码，等待人工处理后继续。",
-            }
-        ):
+        try:
+            resumed = handle_manual_captcha(
+                {
+                    "scope": "detail_html",
+                    "url": url,
+                    "title": str(record.get("title") or record.get("project_name") or ""),
+                    "message": "详情页触发验证码，等待人工处理后继续。",
+                }
+            )
+        except ManualCaptchaRequired:
+            return record
+        if resumed:
             try:
                 html_text = fetch_html(url, cookie)
             except Exception:
@@ -2975,14 +3108,18 @@ def enrich_record_with_detail(record: dict[str, Any], cookie: str) -> dict[str, 
         rendered_tables = list(rendered_payload.get("tables") or [])
         if is_captcha_html(rendered_text):
             register_detail_captcha_hit()
-            if handle_manual_captcha(
-                {
-                    "scope": "rendered_open_record",
-                    "url": url,
-                    "title": str(record.get("title") or record.get("project_name") or ""),
-                    "message": "开标记录渲染页触发验证码，等待人工处理后继续。",
-                }
-            ):
+            try:
+                resumed = handle_manual_captcha(
+                    {
+                        "scope": "rendered_open_record",
+                        "url": url,
+                        "title": str(record.get("title") or record.get("project_name") or ""),
+                        "message": "开标记录渲染页触发验证码，等待人工处理后继续。",
+                    }
+                )
+            except ManualCaptchaRequired:
+                return record
+            if resumed:
                 try:
                     rendered_payload = fetch_rendered_open_record_payload(url, cookie)
                 except Exception:
@@ -3073,15 +3210,15 @@ def fetch_page(cookie: str, config: SearchConfig, page_num: int) -> dict[str, An
 
 def fetch_page_with_fallback(cookie: str, config: SearchConfig, page_num: int) -> dict[str, Any]:
     """Try the strict province-filtered query first, then fall back to area post-filtering."""
-    primary = fetch_page(cookie, config, page_num)
-    primary_list = (primary.get("data") or {}).get("list")
+    primary = ensure_search_payload(fetch_page(cookie, config, page_num))
+    primary_list = (primary.get("data") or {}).get("list") if isinstance(primary.get("data"), dict) else []
     if primary_list:
         return primary
 
     if config.province:
         relaxed = dataclasses.replace(config, province="", industry="")
-        relaxed_result = fetch_page(cookie, relaxed, page_num)
-        relaxed_list = (relaxed_result.get("data") or {}).get("list")
+        relaxed_result = ensure_search_payload(fetch_page(cookie, relaxed, page_num))
+        relaxed_list = (relaxed_result.get("data") or {}).get("list") if isinstance(relaxed_result.get("data"), dict) else []
         if relaxed_list:
             return relaxed_result
     return primary
@@ -3090,110 +3227,199 @@ def fetch_page_with_fallback(cookie: str, config: SearchConfig, page_num: int) -
 def load_records(cookie: str, config: SearchConfig) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    emit_progress("search_start", max_pages=config.max_pages, page_size=config.page_size)
-    for page in range(1, config.max_pages + 1):
-        abort_if_requested()
-        emit_progress("search_page_start", page=page, max_pages=config.max_pages, collected_records=len(records))
-        data = fetch_page_with_fallback(cookie, config, page)
-        if (data.get("textVerify") or data.get("imgData")) and not (data.get("data") or {}).get("list"):
-            register_captcha_hit(SEARCH_FETCH_STATE, base_cooldown=180.0, max_cooldown=1800.0)
-            captcha_meta = extract_captcha_meta_from_search_response(data)
-            if captcha_meta:
-                write_captcha_image_if_needed(config, captcha_meta)
-                LAST_FETCH_META["anti_verify_text"] = captcha_meta.get("text_verify")
+    queries = expand_search_queries(config.keywords)
+    limited_queries: list[str] = []
+    emit_progress("search_start", max_pages=config.max_pages, page_size=config.page_size, query_count=len(queries))
+    for query_index, query in enumerate(queries, start=1):
+        query_config = dataclasses.replace(config, keywords=query)
+        emit_progress("search_query_start", query=query, query_index=query_index, query_count=len(queries))
+        for page in range(1, config.max_pages + 1):
+            abort_if_requested()
             emit_progress(
-                "captcha_detected",
+                "search_page_start",
                 page=page,
                 max_pages=config.max_pages,
-                text_verify=str((captcha_meta or {}).get("text_verify") or ""),
+                collected_records=len(records),
+                query=query,
+                query_index=query_index,
+                query_count=len(queries),
             )
-            if config.captcha_auto_attempts > 0:
-                emit_progress("captcha_auto_attempt_start", page=page, max_pages=config.max_pages)
-                data = auto_attempt_search_captcha(cookie, config)
-                if (data.get("data") or {}).get("list"):
-                    clear_captcha_hits(SEARCH_FETCH_STATE)
-                    emit_progress("captcha_auto_attempt_success", page=page, max_pages=config.max_pages)
-                else:
-                    captcha_meta = extract_captcha_meta_from_search_response(data)
-                    if captcha_meta:
-                        write_captcha_image_if_needed(config, captcha_meta)
-                        LAST_FETCH_META["anti_verify_text"] = captcha_meta.get("text_verify")
-                    emit_progress("captcha_auto_attempt_failed", page=page, max_pages=config.max_pages)
-            elif config.captcha_clicks:
-                submit_search_captcha(cookie, config.captcha_clicks)
-                data = fetch_page_with_fallback(cookie, config, page)
-                if not ((data.get("data") or {}).get("list")) and (data.get("textVerify") or data.get("imgData")):
-                    captcha_meta = extract_captcha_meta_from_search_response(data)
-                    if captcha_meta:
-                        write_captcha_image_if_needed(config, captcha_meta)
-                        LAST_FETCH_META["anti_verify_text"] = captcha_meta.get("text_verify")
-            if not ((data.get("data") or {}).get("list")) and (data.get("textVerify") or data.get("imgData")):
-                resumed = handle_manual_captcha(
-                    {
-                        "scope": "search_list",
-                        "page": page,
-                        "max_pages": config.max_pages,
-                        "text_verify": str((captcha_meta or {}).get("text_verify") or ""),
-                        "url": LOGIN_URL,
-                        "message": "列表页触发验证码，等待人工处理后继续。",
-                    }
+            data = fetch_page_with_fallback(cookie, query_config, page)
+            payload = data.get("data") or {}
+            page_items = payload.get("list") or []
+            is_limit = bool(payload.get("isLimit"))
+            if data.get("antiEncrypt") == 1 and data.get("__decrypt_error__"):
+                emit_progress(
+                    "search_query_encrypted",
+                    page=page,
+                    max_pages=config.max_pages,
+                    query=query,
+                    query_index=query_index,
+                    query_count=len(queries),
+                    decrypt_error=str(data.get("__decrypt_error__") or ""),
                 )
-                if resumed:
-                    data = fetch_page_with_fallback(cookie, config, page)
-            if not ((data.get("data") or {}).get("list")):
-                raise SystemExit("searchList returned antiVerify captcha instead of results.")
-        clear_captcha_hits(SEARCH_FETCH_STATE)
-        if data.get("error_code") not in (0, "0", None):
-            raise SystemExit(f"searchList failed on page {page}: {data}")
-        payload = data.get("data") or {}
-        page_items = payload.get("list") or []
-        emit_progress(
-            "search_page_loaded",
-            page=page,
-            max_pages=config.max_pages,
-            page_items=len(page_items),
-            collected_records=len(records),
-        )
-        if not page_items:
-            break
-        for item in page_items:
-            abort_if_requested()
-            if config.province and str(item.get("area") or "") != config.province:
-                continue
-            if not matches_keywords(item, config.keywords):
-                continue
-            record = canonical_record(item)
-            if config.fetch_details:
-                record = enrich_record_with_detail(record, cookie if not config.input_json else "")
-                record = reparse_record_from_detail(record)
-            record_id = str(record.get("id") or hashlib.md5(json.dumps(item, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest())
-            if record_id in seen_ids:
-                continue
-            seen_ids.add(record_id)
-            records.append(record)
-        grouped_count = len(merge_project_groups(group_records(normalize_records_after_detail(records))))
-        emit_progress(
-            "search_page_done",
-            page=page,
-            max_pages=config.max_pages,
-            collected_records=len(records),
-            grouped_projects=grouped_count,
-        )
+                raise SystemExit("searchList encrypted response.")
+            if (data.get("textVerify") or data.get("imgData")) and not page_items:
+                register_captcha_hit(SEARCH_FETCH_STATE, base_cooldown=180.0, max_cooldown=1800.0)
+                captcha_meta = extract_captcha_meta_from_search_response(data)
+                if captcha_meta:
+                    write_captcha_image_if_needed(query_config, captcha_meta)
+                    LAST_FETCH_META["anti_verify_text"] = captcha_meta.get("text_verify")
+                emit_progress(
+                    "captcha_detected",
+                    page=page,
+                    max_pages=config.max_pages,
+                    text_verify=str((captcha_meta or {}).get("text_verify") or ""),
+                    query=query,
+                    query_index=query_index,
+                    query_count=len(queries),
+                )
+                if config.captcha_auto_attempts > 0:
+                    emit_progress("captcha_auto_attempt_start", page=page, max_pages=config.max_pages, query=query)
+                    data = auto_attempt_search_captcha(cookie, query_config)
+                    payload = data.get("data") or {}
+                    page_items = payload.get("list") or []
+                    if page_items:
+                        clear_captcha_hits(SEARCH_FETCH_STATE)
+                        emit_progress("captcha_auto_attempt_success", page=page, max_pages=config.max_pages, query=query)
+                    else:
+                        captcha_meta = extract_captcha_meta_from_search_response(data)
+                        if captcha_meta:
+                            write_captcha_image_if_needed(query_config, captcha_meta)
+                            LAST_FETCH_META["anti_verify_text"] = captcha_meta.get("text_verify")
+                        emit_progress("captcha_auto_attempt_failed", page=page, max_pages=config.max_pages, query=query)
+                elif config.captcha_clicks:
+                    submit_search_captcha(cookie, config.captcha_clicks)
+                    data = fetch_page_with_fallback(cookie, query_config, page)
+                    payload = data.get("data") or {}
+                    page_items = payload.get("list") or []
+                    if not page_items and (data.get("textVerify") or data.get("imgData")):
+                        captcha_meta = extract_captcha_meta_from_search_response(data)
+                        if captcha_meta:
+                            write_captcha_image_if_needed(query_config, captcha_meta)
+                            LAST_FETCH_META["anti_verify_text"] = captcha_meta.get("text_verify")
+                if not page_items and (data.get("textVerify") or data.get("imgData")):
+                    try:
+                        resumed = handle_manual_captcha(
+                            {
+                                "scope": "search_list",
+                                "page": page,
+                                "max_pages": config.max_pages,
+                                "text_verify": str((captcha_meta or {}).get("text_verify") or ""),
+                                "url": LOGIN_URL,
+                                "message": "列表页触发验证码，等待人工处理后继续。",
+                            }
+                        )
+                    except ManualCaptchaRequired:
+                        resumed = False
+                    if resumed:
+                        data = fetch_page_with_fallback(cookie, query_config, page)
+                        payload = data.get("data") or {}
+                        page_items = payload.get("list") or []
+                if not page_items:
+                    raise SystemExit("searchList returned antiVerify captcha instead of results.")
+            clear_captcha_hits(SEARCH_FETCH_STATE)
+            if data.get("error_code") not in (0, "0", None):
+                raise SystemExit(f"searchList failed on page {page}: {data}")
+            if is_limit and not page_items:
+                limited_queries.append(query)
+                emit_progress(
+                    "search_query_limited",
+                    page=page,
+                    max_pages=config.max_pages,
+                    query=query,
+                    query_index=query_index,
+                    query_count=len(queries),
+                    intercept_keywords=str(payload.get('interceptKeyWords') or ''),
+                )
+                break
+            emit_progress(
+                "search_page_loaded",
+                page=page,
+                max_pages=config.max_pages,
+                page_items=len(page_items),
+                collected_records=len(records),
+                query=query,
+                query_index=query_index,
+                query_count=len(queries),
+            )
+            if not page_items:
+                break
+            for item in page_items:
+                abort_if_requested()
+                if config.province and str(item.get("area") or "") != config.province:
+                    continue
+                if not matches_keywords(item, config.keywords):
+                    continue
+                record = canonical_record(item)
+                if config.fetch_details:
+                    record = enrich_record_with_detail(record, cookie if not config.input_json else "")
+                    record = reparse_record_from_detail(record)
+                record_id = str(record.get("id") or hashlib.md5(json.dumps(item, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest())
+                if record_id in seen_ids:
+                    continue
+                seen_ids.add(record_id)
+                records.append(record)
+            grouped_count = len(merge_project_groups(group_records(normalize_records_after_detail(records))))
+            emit_progress(
+                "search_page_done",
+                page=page,
+                max_pages=config.max_pages,
+                collected_records=len(records),
+                grouped_projects=grouped_count,
+                query=query,
+                query_index=query_index,
+                query_count=len(queries),
+            )
+    if not records and limited_queries and len(limited_queries) == len(queries):
+        LAST_FETCH_META["source_mode"] = "searchList"
+        raise SystemExit("searchList keyword limited.")
     return records
 
 
 def probe_search_access(cookie: str, config: SearchConfig) -> dict[str, Any]:
-    data = fetch_page_with_fallback(cookie, dataclasses.replace(config, max_pages=1, fetch_details=False), 1)
-    payload = data.get("data") or {}
-    page_items = payload.get("list") or []
-    captcha_meta = extract_captcha_meta_from_search_response(data) or {}
+    queries = expand_search_queries(config.keywords)
+    summaries: list[dict[str, Any]] = []
+    for query in queries:
+        query_config = dataclasses.replace(config, keywords=query, max_pages=1, fetch_details=False)
+        data = fetch_page_with_fallback(cookie, query_config, 1)
+        payload = data.get("data") or {}
+        page_items = payload.get("list") or []
+        captcha_meta = extract_captcha_meta_from_search_response(data) or {}
+        is_limit = bool(payload.get("isLimit"))
+        summaries.append(
+            {
+                "query": query,
+                "ok": bool(page_items) or (not bool(captcha_meta) and not is_limit),
+                "has_list": bool(page_items),
+                "list_count": len(page_items),
+                "has_captcha": bool(captcha_meta),
+                "text_verify": str(captcha_meta.get("text_verify") or ""),
+                "anti_verify": bool(data.get("textVerify") or data.get("imgData") or data.get("antiVerify") not in (None, 0, "0")),
+                "is_limit": is_limit,
+                "intercept_keywords": str(payload.get("interceptKeyWords") or ""),
+            }
+        )
+        if page_items:
+            return {
+                "ok": True,
+                "has_list": True,
+                "list_count": len(page_items),
+                "has_captcha": False,
+                "text_verify": "",
+                "anti_verify": False,
+                "query_details": summaries,
+            }
+    has_captcha = any(item.get("has_captcha") for item in summaries)
     return {
-        "ok": bool(page_items) or not bool(captcha_meta),
-        "has_list": bool(page_items),
-        "list_count": len(page_items),
-        "has_captcha": bool(captcha_meta),
-        "text_verify": str(captcha_meta.get("text_verify") or ""),
-        "anti_verify": bool(data.get("textVerify") or data.get("imgData") or data.get("antiVerify") not in (None, 0, "0")),
+        "ok": any(item.get("ok") for item in summaries) or not has_captcha,
+        "has_list": False,
+        "list_count": 0,
+        "has_captcha": has_captcha,
+        "text_verify": next((str(item.get("text_verify") or "") for item in summaries if item.get("text_verify")), ""),
+        "anti_verify": any(item.get("anti_verify") for item in summaries),
+        "keyword_limited": all(item.get("is_limit") for item in summaries) if summaries else False,
+        "query_details": summaries,
     }
 
 
@@ -3793,8 +4019,19 @@ def load_records_from_area_listing(cookie: str, config: SearchConfig) -> list[di
     records: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     detail_count = 0
+    total_pages = max(1, config.max_pages) * max(1, len(sources))
+    page_index = 0
+    emit_progress("search_start", max_pages=total_pages, site="jianyu")
     for source in sources:
         for page in range(1, config.max_pages + 1):
+            page_index += 1
+            emit_progress(
+                "search_page_start",
+                page=page_index,
+                max_pages=total_pages,
+                collected_records=len(records),
+                grouped_projects=len(records),
+            )
             page_url = build_listing_page_url(source, page)
             try:
                 html_text = fetch_html(page_url, cookie)
@@ -3803,6 +4040,14 @@ def load_records_from_area_listing(cookie: str, config: SearchConfig) -> list[di
                     break
                 raise
             page_records = extract_records_from_area_listing_html(html_text, config, page_url, start_date)
+            emit_progress(
+                "search_page_loaded",
+                page=page_index,
+                max_pages=total_pages,
+                page_items=len(page_records),
+                collected_records=len(records) + len(page_records),
+                grouped_projects=len(records) + len(page_records),
+            )
             if not page_records:
                 break
             stop_due_to_date = False
@@ -3817,9 +4062,29 @@ def load_records_from_area_listing(cookie: str, config: SearchConfig) -> list[di
                     stop_due_to_date = True
                     continue
                 if config.fetch_details and (config.detail_limit <= 0 or detail_count < config.detail_limit):
+                    emit_progress(
+                        "detail_fetch_start",
+                        current=detail_count + 1,
+                        total=0,
+                        title=str(record.get("title") or record.get("project_name") or ""),
+                    )
                     record = reparse_record_from_detail(enrich_record_with_detail(record, cookie))
                     detail_count += 1
+                    emit_progress(
+                        "detail_fetch_done",
+                        current=detail_count,
+                        total=0,
+                        title=str(record.get("title") or record.get("project_name") or ""),
+                        core_projects=sum(1 for item in records if item.get("budget") is not None and (item.get("bid_amount") is not None or item.get("winner") is not None)),
+                    )
                 records.append(record)
+            emit_progress(
+                "search_page_done",
+                page=page_index,
+                max_pages=total_pages,
+                collected_records=len(records),
+                grouped_projects=len(records),
+            )
             if stop_due_to_date:
                 break
     global LAST_FETCH_META
@@ -3914,7 +4179,7 @@ def build_project_backfill_target(group: list[dict[str, Any]]) -> dict[str, Any]
         primary_gap = "missing_result"
     elif "招标公告" in missing_notice_types:
         primary_gap = "missing_notice"
-    return {
+    target = {
         "primary_name": primary_name,
         "names": names,
         "bid_numbers": bid_numbers,
@@ -3924,6 +4189,11 @@ def build_project_backfill_target(group: list[dict[str, Any]]) -> dict[str, Any]
         "min_publish_date": min(publish_dates) if publish_dates else None,
         "max_publish_date": max(publish_dates) if publish_dates else None,
     }
+    if primary_name and primary_name not in target["names"]:
+        target["names"].insert(0, primary_name)
+    if not target["names"] and bid_numbers:
+        target["names"] = [bid_numbers[0]]
+    return target
 
 
 def build_project_backfill_queries(target: dict[str, Any]) -> list[str]:
@@ -3944,6 +4214,7 @@ def build_project_backfill_queries(target: dict[str, Any]) -> list[str]:
         add(primary_name)
         compact_name = normalize_project_key(primary_name)
         add(compact_name)
+        add(clean_project_name(primary_name) or primary_name)
         tokens = [token for token in re.split(r"[()（）\-_/、，,;；\s]+", compact_name) if len(token) >= 3]
         if len(tokens) >= 2:
             add("".join(tokens[:2]))
@@ -3970,6 +4241,21 @@ def build_project_backfill_queries(target: dict[str, Any]) -> list[str]:
             add(f"{primary_name} 中标候选人")
             add(f"{primary_name} 中标候选人公示")
             add(f"{primary_name} 成交候选人公示")
+        if "开标记录" in missing_notice_types:
+            add(f"{primary_name} 开标结果记录")
+            add(f"{primary_name} 开标结果")
+            add(f"{primary_name} 投标总报价")
+            add(f"{primary_name} 投标人名称")
+        if "中标结果" in missing_notice_types:
+            add(f"{primary_name} 中标结果公告")
+            add(f"{primary_name} 中标结果公示")
+            add(f"{primary_name} 中标公告")
+            add(f"{primary_name} 成交结果公告")
+        if "招标公告" in missing_notice_types:
+            add(f"{primary_name} 招标公告")
+            add(f"{primary_name} 招标文件")
+            add(f"{primary_name} 招标")
+            add(f"{primary_name} 投标人须知")
     for bid_number in target.get("bid_numbers") or []:
         if "开标记录" in missing_notice_types:
             add(f"{bid_number} 开标记录")
@@ -4061,11 +4347,19 @@ def targeted_area_backfill_records(cookie: str, config: SearchConfig, seed_recor
     recovered_result_records = 0
     targeted_project_count = 0
     targeted_missing_open_project_count = 0
+    total_targets = len(grouped)
+    emit_progress("detail_plan_ready", total=total_targets, grouped_projects=total_targets, core_projects=0)
     for _, group in grouped.items():
         target = build_project_backfill_target(group)
         if not target.get("primary_name"):
             continue
         targeted_project_count += 1
+        emit_progress(
+            "detail_fetch_start",
+            current=targeted_project_count,
+            total=total_targets,
+            title=str(target.get("primary_name") or ""),
+        )
         target_hits: list[dict[str, Any]] = []
         target_seen: set[str] = set()
         matched_notice_types = set(target.get("matched_notice_types") or [])
@@ -4161,6 +4455,13 @@ def targeted_area_backfill_records(cookie: str, config: SearchConfig, seed_recor
             elif notice_type in {"中标结果", "中标候选人"}:
                 recovered_result_records += 1
             collected.append(enriched)
+        emit_progress(
+            "detail_fetch_done",
+            current=targeted_project_count,
+            total=total_targets,
+            title=str(target.get("primary_name") or ""),
+            core_projects=len(collected),
+        )
     LAST_FETCH_META["targeted_backfill_projects"] = targeted_project_count
     LAST_FETCH_META["targeted_backfill_missing_open_projects"] = targeted_missing_open_project_count
     LAST_FETCH_META["targeted_backfill_recovered_open_records"] = recovered_open_records
@@ -4334,7 +4635,7 @@ def backfill_project_records(cookie: str, config: SearchConfig, seed_records: li
         return all_records
     should_try_search_backfill = config.search_backfill_mode == "on"
     if config.search_backfill_mode == "auto":
-        should_try_search_backfill = config.source_mode != "area_listing"
+        should_try_search_backfill = True
     if should_try_search_backfill:
         precise_search_backfilled = backfill_project_records_via_precise_search(cookie, config, seed_records)
         all_records = merge_records_by_url(all_records, precise_search_backfilled)
@@ -4627,35 +4928,116 @@ def group_records(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
     return grouped
 
 
+TARGET_PROJECT_CATEGORY_TOKENS = (
+    "房建",
+    "房屋建筑",
+    "住宅",
+    "公租房",
+    "保障房",
+    "安置房",
+    "周转房",
+    "业务技术用房",
+    "办公楼",
+    "综合楼",
+    "宿舍楼",
+    "教学楼",
+    "中学",
+    "小学",
+    "校舍",
+    "实验楼",
+    "门诊楼",
+    "住院楼",
+    "幼儿园",
+    "学校",
+    "医院",
+    "市政",
+    "市政工程",
+    "道路工程",
+    "桥梁工程",
+    "给排水",
+    "供水",
+    "饮水",
+    "农村饮水",
+    "供排水",
+    "水环境",
+    "供热管网",
+    "排水管网",
+    "水利",
+    "水库",
+    "灌区",
+    "河道",
+    "堤防",
+    "泵站",
+    "公路",
+    "国道",
+    "省道",
+    "县道",
+    "乡道",
+    "城中村改造",
+    "棚户区改造",
+    "人居环境整治",
+)
+
+TARGET_PROJECT_EXCLUDE_TOKENS = (
+    "EPC",
+    "EP C",
+    "工程总承包",
+    "设计施工总承包",
+    "勘察设计施工总承包",
+    "监理",
+    "勘察",
+    "设计",
+    "造价咨询",
+    "咨询服务",
+    "检测服务",
+    "检测",
+    "测绘",
+    "审计",
+)
+
+TARGET_EVALUATION_TOKENS = (
+    "智能化评审",
+    "智能化评标",
+    "智能评审",
+)
+
+
 def looks_like_building_project(text: str) -> bool:
-    text = str(text or "")
-    return any(
-        token in text
-        for token in (
-            "项目",
-            "工程",
-            "房",
-            "楼",
-            "改造",
-            "建设",
-            "维修",
-            "园",
-            "用房",
-            "周转房",
-            "幼儿园",
-            "监理",
-            "施工",
-            "EPC",
-            "总承包",
-            "安置点",
-            "棚户",
-            "办公楼",
-            "业务技术用房",
-            "基础设施",
-            "医院",
-            "学校",
+    text = normalize_text(str(text or ""))
+    if not text:
+        return False
+    if any(token.lower() in text.lower() for token in TARGET_PROJECT_EXCLUDE_TOKENS):
+        return False
+    if not any(token in text for token in TARGET_PROJECT_CATEGORY_TOKENS):
+        return False
+    return any(token in text for token in ("项目", "工程", "建设", "改造", "维修", "新建", "扩建"))
+
+
+def is_target_construction_record(record: dict[str, Any]) -> bool:
+    haystack = "\n".join(
+        str(part or "")
+        for part in (
+            record.get("title"),
+            record.get("project_name"),
+            record.get("industry"),
+            record.get("raw_detail_text"),
+            (record.get("raw") or {}).get("detail"),
         )
     )
+    return looks_like_building_project(haystack)
+
+
+def has_intelligent_evaluation(record: dict[str, Any]) -> bool:
+    haystack = "\n".join(
+        str(part or "")
+        for part in (
+            record.get("title"),
+            record.get("project_name"),
+            record.get("raw_detail_text"),
+            (record.get("raw") or {}).get("detail"),
+        )
+    )
+    return any(token in haystack for token in TARGET_EVALUATION_TOKENS)
 
 
 def select_candidate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4666,6 +5048,8 @@ def select_candidate_records(records: list[dict[str, Any]]) -> list[dict[str, An
             continue
         sample_title = next((str(item.get("project_name") or item.get("title") or "") for item in group if item.get("project_name") or item.get("title")), "")
         if not looks_like_building_project(sample_title):
+            continue
+        if not any(item.get("notice_type") == "招标公告" and has_intelligent_evaluation(item) for item in group):
             continue
         notice_blob = "\n".join(str(item.get("title") or "") for item in group)
         if not any(token in notice_blob for token in ("中标", "成交", "结果", "候选人", "开标", "招标公告", "采购公告")):
@@ -4844,19 +5228,19 @@ def build_project_summary(project_key: str, group: list[dict[str, Any]], allow_c
     if not bid_quotes:
         issues.append("缺全体报价")
 
-    has_required_prices = winning_price is not None and control_price is not None and bool(bid_quotes)
+    has_required_prices = winning_price is not None and control_price is not None
     has_required_core_fields = (
         control_price is not None
         and winning_price is not None
         and winning_company is not None
-        and bool(bid_quotes)
     )
-    can_analyze_core = has_required_prices and (allow_core_without_notice or notice_record is not None)
+    has_full_quote_fields = has_required_core_fields and bool(bid_quotes)
+    can_analyze_core = has_required_core_fields and (allow_core_without_notice or notice_record is not None)
     file_complete = (
         notice_record is not None
         and open_record is not None
         and result_record is not None
-        and has_required_core_fields
+        and has_full_quote_fields
     )
     source_files = sorted(
         {
@@ -4914,6 +5298,32 @@ def build_project_summary(project_key: str, group: list[dict[str, Any]], allow_c
     min_quote = min(bid_quotes) if bid_quotes else None
     max_down_rate = calc_down_rate(control_price, min_quote) if min_quote is not None else None
     min_down_rate = calc_down_rate(control_price, max_quote) if max_quote is not None else None
+    participant_by_quote: dict[float, str] = {}
+    for participant in bid_participants:
+        if not isinstance(participant, dict):
+            continue
+        quote = participant.get("quote")
+        if quote is None:
+            continue
+        try:
+            quote_value = float(quote)
+        except Exception:
+            continue
+        participant_by_quote.setdefault(
+            quote_value,
+            str(participant.get("company") or participant.get("name") or "").strip() or "未识别单位",
+        )
+    bid_quote_rows = sorted(
+        [
+            {
+                "company": participant_by_quote.get(float(quote), f"报价单位{index}"),
+                "quote": float(quote),
+                "down_rate": calc_down_rate(control_price, float(quote)),
+            }
+            for index, quote in enumerate(bid_quotes, start=1)
+        ],
+        key=lambda row: (row.get("down_rate") is None, -(row.get("down_rate") or -10**9)),
+    )
     if file_complete:
         readiness_stage = "strict_complete"
         primary_blocker = None
@@ -4982,6 +5392,7 @@ def build_project_summary(project_key: str, group: list[dict[str, Any]], allow_c
         "winning_company_source": winning_company_source,
         "bid_quotes": bid_quotes,
         "bid_participants": bid_participants,
+        "bid_quote_rows": bid_quote_rows,
         "attachments": attachments,
         "attachment_count": len(attachments),
         "attachment_links": attachment_links,
@@ -5014,6 +5425,7 @@ def build_project_summary(project_key: str, group: list[dict[str, Any]], allow_c
         "has_winning_company": winning_company is not None,
         "has_bid_quotes": bool(bid_quotes),
         "has_required_core_fields": has_required_core_fields,
+        "has_full_quote_fields": has_full_quote_fields,
         "file_complete": file_complete,
         "can_analyze_core": can_analyze_core,
         "core_ready_reason": None if not can_analyze_core else ("full_three_files" if file_complete else "open_plus_result"),
@@ -5072,6 +5484,7 @@ def build_project_audit_meta(projects: list[dict[str, Any]]) -> dict[str, Any]:
             "winning_price": summary["winning_price"],
             "winning_company": summary["winning_company"],
             "bid_quote_count": summary["bid_quote_count"],
+            "has_bid_quotes": summary.get("has_bid_quotes"),
             "attachment_count": summary.get("attachment_count", 0),
             "attachments": summary.get("attachments", []),
             "attachment_link_count": summary.get("attachment_link_count", 0),
@@ -5165,27 +5578,139 @@ def blocker_to_cn(value: str | None) -> str:
     return mapping.get(value, str(value or "无"))
 
 
+def project_control_bucket(control_price: float | None) -> str:
+    if control_price is None:
+        return "控制价缺失"
+    if control_price < 10_000_000:
+        return "小于1000万"
+    if control_price < 20_000_000:
+        return "1000万-2000万"
+    if control_price < 50_000_000:
+        return "2000万-5000万"
+    if control_price < 100_000_000:
+        return "5000万-1亿"
+    return "1亿及以上"
+
+
+def numeric_stats(values: list[Any]) -> dict[str, Any]:
+    clean_values: list[float] = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            clean_values.append(float(value))
+        except Exception:
+            continue
+    if not clean_values:
+        return {"样本数": 0, "最低": None, "最高": None, "平均": None}
+    return {
+        "样本数": len(clean_values),
+        "最低": min(clean_values),
+        "最高": max(clean_values),
+        "平均": sum(clean_values) / len(clean_values),
+    }
+
+
+def count_numeric_stats(values: list[Any]) -> dict[str, Any]:
+    stats = numeric_stats(values)
+    for key in ("最低", "最高"):
+        if stats[key] is not None:
+            stats[key] = int(stats[key])
+    return stats
+
+
+def build_analysis(projects: list[dict[str, Any]]) -> dict[str, Any]:
+    bucket_order = ["小于1000万", "1000万-2000万", "2000万-5000万", "5000万-1亿", "1亿及以上", "控制价缺失"]
+    buckets: dict[str, dict[str, list[Any]]] = {
+        bucket: {
+            "control_prices": [],
+            "winning_down_rates": [],
+            "quote_down_rates": [],
+            "participant_counts": [],
+            "project_count": [],
+        }
+        for bucket in bucket_order
+    }
+    all_control_prices: list[Any] = []
+    all_winning_down_rates: list[Any] = []
+    all_quote_down_rates: list[Any] = []
+    all_participant_counts: list[Any] = []
+    for item in projects:
+        summary = item.get("summary") or {}
+        control_price = summary.get("control_price")
+        bucket = project_control_bucket(control_price)
+        buckets.setdefault(bucket, {
+            "control_prices": [],
+            "winning_down_rates": [],
+            "quote_down_rates": [],
+            "participant_counts": [],
+            "project_count": [],
+        })
+        buckets[bucket]["project_count"].append(1)
+        if control_price is not None:
+            all_control_prices.append(control_price)
+            buckets[bucket]["control_prices"].append(control_price)
+        winning_down_rate = summary.get("winning_down_rate")
+        if winning_down_rate is not None:
+            all_winning_down_rates.append(winning_down_rate)
+            buckets[bucket]["winning_down_rates"].append(winning_down_rate)
+        quote_down_rates = [
+            row.get("down_rate")
+            for row in (summary.get("bid_quote_rows") or [])
+            if isinstance(row, dict) and row.get("down_rate") is not None
+        ]
+        all_quote_down_rates.extend(quote_down_rates)
+        buckets[bucket]["quote_down_rates"].extend(quote_down_rates)
+        participant_count = summary.get("bid_quote_count")
+        if participant_count is not None:
+            all_participant_counts.append(participant_count)
+            buckets[bucket]["participant_counts"].append(participant_count)
+
+    return {
+        "控制价档位统计": {
+            bucket: {
+                "项目数": len((buckets.get(bucket) or {}).get("project_count") or []),
+                "控制价统计": numeric_stats((buckets.get(bucket) or {}).get("control_prices") or []),
+                "中标价下浮率统计": numeric_stats((buckets.get(bucket) or {}).get("winning_down_rates") or []),
+                "报价下浮率统计": numeric_stats((buckets.get(bucket) or {}).get("quote_down_rates") or []),
+                "参与单位数统计": count_numeric_stats((buckets.get(bucket) or {}).get("participant_counts") or []),
+            }
+            for bucket in bucket_order
+        },
+        "总体统计": {
+            "控制价统计": numeric_stats(all_control_prices),
+            "报价下浮率统计": numeric_stats(all_quote_down_rates),
+            "中标价下浮率统计": numeric_stats(all_winning_down_rates),
+            "参与单位数统计": count_numeric_stats(all_participant_counts),
+            "有控制价项目数": len(all_control_prices),
+            "有中标下浮率项目数": len(all_winning_down_rates),
+            "有报价明细项目数": sum(1 for item in projects if (item.get("summary") or {}).get("bid_quote_rows")),
+        },
+    }
+
+
 def build_customer_project(item: dict[str, Any]) -> dict[str, Any]:
     summary = item.get("summary") or {}
-    participants = summary.get("bid_participants") or []
     quote_list: list[dict[str, Any]] = []
-    if participants:
-        for participant in participants:
-            if not isinstance(participant, dict):
+    if summary.get("bid_quote_rows"):
+        for row in summary.get("bid_quote_rows") or []:
+            if not isinstance(row, dict):
                 continue
             quote_list.append(
                 {
-                    "单位名称": str(participant.get("company") or participant.get("name") or "").strip() or "未识别单位",
-                    "报价": participant.get("quote"),
+                    "单位名称": str(row.get("company") or "").strip() or "未识别单位",
+                    "报价": row.get("quote"),
+                    "下浮率": row.get("down_rate"),
                 }
             )
     else:
         for index, quote in enumerate(summary.get("bid_quotes") or [], start=1):
-            quote_list.append({"单位名称": f"报价单位{index}", "报价": quote})
+            quote_list.append({"单位名称": f"报价单位{index}", "报价": quote, "下浮率": calc_down_rate(summary.get("control_price"), quote)})
 
     return {
         "项目名称": summary.get("project_title") or item.get("project_key") or "",
         "项目编号": summary.get("bid_number") or "",
+        "控制价档位": project_control_bucket(summary.get("control_price")),
         "当前状态": readiness_stage_to_cn(summary.get("readiness_stage")),
         "主要问题": blocker_to_cn(summary.get("primary_blocker")),
         "是否核心数据齐全": yes_no(bool(summary.get("can_analyze_core"))),
@@ -5203,7 +5728,7 @@ def build_customer_project(item: dict[str, Any]) -> dict[str, Any]:
         "最高下浮率": summary.get("max_down_rate"),
         "最低下浮率": summary.get("min_down_rate"),
         "平均下浮率": summary.get("avg_down_rate"),
-        "各单位报价": quote_list,
+        "各单位报价下浮率排序": quote_list,
     }
 
 
@@ -5222,7 +5747,9 @@ def build_customer_json(output: dict[str, Any]) -> dict[str, Any]:
             "归并项目数": meta.get("project_count", 0),
             "核心数据齐全项目数": meta.get("core_analyzable_project_count", 0),
             "三类文件完整项目数": meta.get("file_complete_project_count", 0),
+            "缺全体报价但已保存项目数": meta.get("partial_saved_project_count", 0),
         },
+        "分析": output.get("analysis") or {},
         "项目列表": [build_customer_project(item) for item in projects],
     }
 
@@ -5466,7 +5993,7 @@ def should_fetch_detail_for_batch(record: dict[str, Any], project_summary: dict[
     if notice_type == "招标公告":
         return not has_control
     if notice_type == "开标记录":
-        return has_win and not has_quotes
+        return (not has_quotes) or (not has_control)
     if notice_type == "其他":
         return (not has_control) or (has_win and not has_quotes)
     return False
@@ -5665,7 +6192,7 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                 if config.fetch_details:
                     seed_records = [
                         item for item in records
-                        if looks_like_building_project(str(item.get("project_name") or item.get("title") or ""))
+                        if is_target_construction_record(item)
                     ]
                     candidate_records = backfill_project_records(cookie, dataclasses.replace(config, industry=""), seed_records)
                     candidate_records = merge_records_by_url(seed_records, candidate_records)
@@ -5678,7 +6205,10 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                         if config.detail_limit > 0 and detail_count >= config.detail_limit:
                             records.append(record)
                             continue
-                        records.append(reparse_record_from_detail(enrich_record_with_detail(record, cookie)))
+                        try:
+                            records.append(reparse_record_from_detail(enrich_record_with_detail(record, cookie)))
+                        except ManualCaptchaRequired:
+                            records.append(record)
                         detail_count += 1
             else:
                 cookie = load_cookie(config)
@@ -5686,7 +6216,11 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                 try:
                     records = load_records(cookie, dataclasses.replace(config, industry="", fetch_details=False))
                 except SystemExit as exc:
-                    if "antiVerify captcha" not in str(exc) or config.source_mode == "search":
+                    if (
+                        "antiVerify captcha" not in str(exc)
+                        and "keyword limited" not in str(exc)
+                        and "encrypted response" not in str(exc)
+                    ) or config.source_mode == "search":
                         raise
                     source_mode = "area_listing"
                     cookie = load_cookie(config, required=False)
@@ -5695,7 +6229,7 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                     if config.fetch_details:
                         seed_records = [
                             item for item in records
-                            if looks_like_building_project(str(item.get("project_name") or item.get("title") or ""))
+                            if is_target_construction_record(item)
                         ]
                         candidate_records = backfill_project_records(cookie, dataclasses.replace(config, industry=""), seed_records)
                         candidate_records = merge_records_by_url(seed_records, candidate_records)
@@ -5768,7 +6302,7 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
         if should_backfill_seed_records:
             seed_records = [
                 item for item in records
-                if looks_like_building_project(str(item.get("project_name") or item.get("title") or ""))
+                if is_target_construction_record(item)
             ]
             candidate_records = backfill_project_records(cookie, dataclasses.replace(config, industry=""), seed_records)
             records = merge_records_by_url(records, candidate_records)
@@ -5822,7 +6356,10 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                 total=detail_plan_total,
                 title=str(record.get("title") or record.get("project_name") or ""),
             )
-            hydrated_records.append(reparse_record_from_detail(enrich_record_with_detail(record, cookie)))
+            try:
+                hydrated_records.append(reparse_record_from_detail(enrich_record_with_detail(record, cookie)))
+            except ManualCaptchaRequired:
+                hydrated_records.append(record)
             detail_count += 1
             current_core_count = count_core_projects(hydrated_records + records[len(hydrated_records):], config.allow_core_without_notice)
             emit_progress(
@@ -5859,7 +6396,11 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                     total=detail_plan_total,
                     title=str(record.get("title") or record.get("project_name") or ""),
                 )
-                enriched = reparse_record_from_detail(enrich_record_with_detail(record, cookie))
+                try:
+                    enriched = reparse_record_from_detail(enrich_record_with_detail(record, cookie))
+                except ManualCaptchaRequired:
+                    hydrated_followups.append(record)
+                    continue
                 if is_followup_shell_record(enriched):
                     filtered_followups += 1
                     continue

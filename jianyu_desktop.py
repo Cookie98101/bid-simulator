@@ -10,10 +10,12 @@ from tkinter import filedialog, messagebox, ttk
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 import jianyu_project_collector as collector
+import ggzy_gov_collector as ggzy_collector
 
 
 SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "jianyu_project_collector.py")
 LOGIN_URL = "https://www.jianyu360.cn/jylab/supsearch/index.html?keywords=&selectType=title&searchGroup=1"
+GGZY_URL = "https://www.ggzy.gov.cn/deal/dealList.html"
 
 
 def app_state_dir() -> str:
@@ -66,18 +68,17 @@ class JianyuDesktopApp:
         self.current_progress_base = "暂无进度"
         self.last_status_note = ""
         self.captcha_waiting = False
+        self.last_progress_site = ""
         self.log_lock = threading.Lock()
         self.run_diag_dir = ""
         self.run_log_path = ""
 
         self.province_var = tk.StringVar(value="西藏")
-        self.keywords_var = tk.StringVar(value="房建")
         self.days_var = tk.StringVar(value="30")
         os.makedirs(APP_STATE_DIR, exist_ok=True)
         os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
         self.cookie_var = tk.StringVar(value=DEFAULT_COOKIE_PATH)
-        self.output_var = tk.StringVar(value=os.path.join(os.path.dirname(__file__), "jianyu_range_output.json"))
-        self.report_var = tk.StringVar(value="")
+        self.output_var = tk.StringVar(value=os.path.join(os.path.dirname(__file__), "bid_sources_output.json"))
         self.status_var = tk.StringVar(value="就绪")
         self.progress_text_var = tk.StringVar(value="暂无进度")
 
@@ -92,39 +93,40 @@ class JianyuDesktopApp:
         top = ttk.Frame(self.root, padding=14)
         top.pack(fill="x")
 
-        ttk.Label(top, text="项目关键词").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.keywords_var, width=36).grid(row=0, column=1, sticky="we", padx=8)
+        ttk.Label(top, text="项目地区").grid(row=0, column=0, sticky="w")
+        self.province_entry = ttk.Entry(top, textvariable=self.province_var, width=18)
+        self.province_entry.grid(row=0, column=1, sticky="we", padx=8)
 
-        ttk.Label(top, text="项目地区").grid(row=0, column=2, sticky="w")
-        ttk.Entry(top, textvariable=self.province_var, width=18).grid(row=0, column=3, sticky="we", padx=8)
+        ttk.Label(top, text="最近天数").grid(row=0, column=2, sticky="w")
+        self.days_entry = ttk.Entry(top, textvariable=self.days_var, width=8)
+        self.days_entry.grid(row=0, column=3, sticky="w", padx=8)
 
-        ttk.Label(top, text="最近天数").grid(row=0, column=4, sticky="w")
-        ttk.Entry(top, textvariable=self.days_var, width=8).grid(row=0, column=5, sticky="we", padx=8)
-
-        ttk.Label(top, text="Cookie 文件").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(top, textvariable=self.cookie_var, width=72).grid(row=1, column=1, columnspan=4, sticky="we", padx=8, pady=(10, 0))
-        cookie_actions = ttk.Frame(top)
-        cookie_actions.grid(row=1, column=5, padx=(0, 8), pady=(10, 0), sticky="e")
-        ttk.Button(cookie_actions, text="选择", command=self._pick_cookie).pack(side="left")
-        ttk.Button(cookie_actions, text="打开登录页", command=self._open_login_browser).pack(side="left", padx=(8, 0))
-        ttk.Button(cookie_actions, text="保存登录态", command=self._save_login_state).pack(side="left", padx=(8, 0))
+        self.cookie_label = ttk.Label(top, text="剑鱼 Cookie")
+        self.cookie_label.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.cookie_entry = ttk.Entry(top, textvariable=self.cookie_var, width=72)
+        self.cookie_entry.grid(row=1, column=1, columnspan=3, sticky="we", padx=8, pady=(10, 0))
+        self.cookie_actions = ttk.Frame(top)
+        self.cookie_actions.grid(row=1, column=4, padx=(0, 8), pady=(10, 0), sticky="e")
+        ttk.Button(self.cookie_actions, text="选择", command=self._pick_cookie).pack(side="left")
+        self.login_button = ttk.Button(self.cookie_actions, text="打开登录页", command=self._open_login_browser)
+        self.login_button.pack(side="left", padx=(8, 0))
+        self.save_login_button = ttk.Button(self.cookie_actions, text="保存登录态", command=self._save_login_state)
+        self.save_login_button.pack(side="left", padx=(8, 0))
 
         ttk.Label(top, text="输出 JSON").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(top, textvariable=self.output_var, width=72).grid(row=2, column=1, columnspan=4, sticky="we", padx=8, pady=(10, 0))
-        ttk.Button(top, text="选择", command=self._pick_output).grid(row=2, column=5, padx=(0, 8), pady=(10, 0))
+        ttk.Entry(top, textvariable=self.output_var, width=72).grid(row=2, column=1, columnspan=3, sticky="we", padx=8, pady=(10, 0))
+        ttk.Button(top, text="选择", command=self._pick_output).grid(row=2, column=4, padx=(0, 8), pady=(10, 0))
 
-        ttk.Label(top, text="输出 MD(可留空)").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(top, textvariable=self.report_var, width=72).grid(row=3, column=1, columnspan=4, sticky="we", padx=8, pady=(10, 0))
-        ttk.Button(top, text="选择", command=self._pick_report).grid(row=3, column=5, padx=(0, 8), pady=(10, 0))
-
-        ttk.Checkbutton(
+        self.keep_browser_check = ttk.Checkbutton(
             top,
-            text="抓取时复用当前登录浏览器会话",
+            text="剑鱼抓取时复用已保存浏览器会话（全国公共资源不需要登录态）",
             variable=self.keep_browser_session_var,
-        ).grid(row=4, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        )
+        self.keep_browser_check.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         top.columnconfigure(1, weight=1)
-        top.columnconfigure(3, weight=1)
+        top.columnconfigure(2, weight=0)
+        top.columnconfigure(3, weight=0)
 
         actions = ttk.Frame(self.root, padding=(14, 0, 14, 8))
         actions.pack(fill="x")
@@ -155,6 +157,8 @@ class JianyuDesktopApp:
         self.summary.insert("1.0", "暂无结果")
         self.summary.configure(state="disabled")
         body.add(summary_frame, weight=1)
+        self.root.title("投标项目抓取器 - 双源版")
+        self.status_var.set("就绪：默认同时抓取剑鱼和全国公共资源，Cookie 只用于剑鱼。")
 
     def _pick_cookie(self) -> None:
         path = filedialog.askopenfilename(title="选择 cookie 文件", filetypes=[("Text", "*.txt"), ("All files", "*.*")])
@@ -166,10 +170,12 @@ class JianyuDesktopApp:
         if path:
             self.output_var.set(path)
 
-    def _pick_report(self) -> None:
-        path = filedialog.asksaveasfilename(title="选择输出 MD", defaultextension=".md", filetypes=[("Markdown", "*.md")])
-        if path:
-            self.report_var.set(path)
+    def _on_site_changed(self) -> None:
+        base_dir = os.path.dirname(__file__)
+        self.root.title("投标项目抓取器 - 双源版")
+        if not self.output_var.get().strip():
+            self.output_var.set(os.path.join(base_dir, "bid_sources_output.json"))
+        self.status_var.set("就绪：默认同时抓取剑鱼和全国公共资源，Cookie 只用于剑鱼。")
 
     def _launch_login_context(self) -> None:
         if self.login_context is not None:
@@ -201,7 +207,14 @@ class JianyuDesktopApp:
             raise RuntimeError(f"无法启动浏览器上下文：{last_error}")
         pages = self.login_context.pages
         self.login_page = pages[0] if pages else self.login_context.new_page()
-        self.login_page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        try:
+            if not self.login_page.url or "jianyu360.cn" not in self.login_page.url:
+                self.login_page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            try:
+                self.login_page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                pass
 
     def _open_login_browser(self) -> None:
         try:
@@ -249,14 +262,15 @@ class JianyuDesktopApp:
             messagebox.showerror("保存失败", f"无法保存登录态：{exc}")
 
     def _refresh_cookie_from_browser_if_possible(self) -> None:
-        if not self.keep_browser_session_var.get():
-            return
         if self.login_context is None:
             return
-        cookie_text = self._build_cookie_string()
-        cookie_path = self.cookie_var.get().strip() or DEFAULT_COOKIE_PATH
-        with open(cookie_path, "w", encoding="utf-8") as fp:
-            fp.write(cookie_text)
+        try:
+            cookie_text = self._build_cookie_string()
+            cookie_path = self.cookie_var.get().strip() or DEFAULT_COOKIE_PATH
+            with open(cookie_path, "w", encoding="utf-8") as fp:
+                fp.write(cookie_text)
+        except Exception:
+            pass
 
     def _get_request_page(self):
         self._launch_login_context()
@@ -264,6 +278,12 @@ class JianyuDesktopApp:
             raise RuntimeError("登录浏览器尚未打开。")
         if self.worker_page is None or self.worker_page.is_closed():
             self.worker_page = self.login_context.new_page()
+        try:
+            current_url = self.worker_page.url or ""
+        except Exception:
+            current_url = ""
+        if "jianyu360.cn" not in current_url:
+            self.worker_page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         return self.worker_page
 
     def _browser_request(self, method: str, url: str, payload, headers: dict | None, expect: str):
@@ -271,27 +291,166 @@ class JianyuDesktopApp:
             return self._run_on_main_thread_sync(self._browser_request, method, url, payload, headers, expect)
         page = self._get_request_page()
         js = """async ({ method, url, payload, headers, expect }) => {
-            const options = { method, headers: headers || {}, credentials: 'include' };
-            if (payload !== undefined && payload !== null) {
-                const contentType = (options.headers['content-type'] || options.headers['Content-Type'] || '').toLowerCase();
-                if (contentType.includes('application/json')) {
-                    options.body = JSON.stringify(payload);
-                } else if (contentType.includes('application/x-www-form-urlencoded')) {
-                    options.body = new URLSearchParams(payload).toString();
+            async function decryptJianyuPayload(data) {
+                if (!data || typeof data !== 'object' || data.antiEncrypt !== 1 || !data.data || !data.secretKey) {
+                    return data;
+                }
+                if (!window.__jianyuDecryptor) {
+                    window.__jianyuDecryptor = {
+                        iframe: null,
+                        iframeName: '',
+                        readyPromise: null,
+                        pending: {},
+                    };
+                }
+                const decryptor = window.__jianyuDecryptor;
+                if (!decryptor.readyPromise) {
+                    decryptor.readyPromise = new Promise((resolve, reject) => {
+                        const iframe = document.createElement('iframe');
+                        iframe.name = `jianyu_decrypt_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+                        iframe.src = '/page_decrypt/index.html';
+                        iframe.style.display = 'none';
+                        iframe.onload = () => resolve();
+                        iframe.onerror = () => reject(new Error('解密 iframe 加载失败'));
+                        document.body.appendChild(iframe);
+                        decryptor.iframe = iframe;
+                        decryptor.iframeName = iframe.name;
+
+                        if (!window.__jianyuDecryptMessageListenerInstalled) {
+                            window.__jianyuDecryptMessageListenerInstalled = true;
+                            window.addEventListener('message', (event) => {
+                                const message = event.data || {};
+                                if (message.type !== 'after-decrypt' || !message.id) {
+                                    return;
+                                }
+                                const task = window.__jianyuDecryptor && window.__jianyuDecryptor.pending[message.id];
+                                if (!task) {
+                                    return;
+                                }
+                                delete window.__jianyuDecryptor.pending[message.id];
+                                if (message.plainText) {
+                                    task.resolve(message);
+                                } else {
+                                    task.reject(new Error(message.error || '解密 iframe 未返回明文'));
+                                }
+                            });
+                        }
+                    });
+                }
+                await decryptor.readyPromise;
+                return await new Promise((resolve, reject) => {
+                    const id = `jy_${Date.now()}_${Math.random().toString(36).slice(2)}_${decryptor.iframeName}`;
+                    const timer = setTimeout(() => {
+                        delete decryptor.pending[id];
+                        reject(new Error('解密 iframe 超时'));
+                    }, 15000);
+                    decryptor.pending[id] = {
+                        resolve: (message) => {
+                            clearTimeout(timer);
+                            try {
+                                resolve(JSON.parse(message.plainText));
+                            } catch (error) {
+                                reject(error);
+                            }
+                        },
+                        reject: (error) => {
+                            clearTimeout(timer);
+                            reject(error);
+                        },
+                    };
+                    const targetWindow = decryptor.iframe && decryptor.iframe.contentWindow;
+                    if (!targetWindow) {
+                        clearTimeout(timer);
+                        delete decryptor.pending[id];
+                        reject(new Error('解密 iframe 不可用'));
+                        return;
+                    }
+                    targetWindow.postMessage(
+                        {
+                            id,
+                            base64Key: data.secretKey,
+                            cipherText: data.data,
+                            fromOrigin: location.origin,
+                            type: 'decrypt',
+                        },
+                        location.origin
+                    );
+                });
+            }
+            const hasJQuery = typeof window.$ === 'function' && typeof window.$.ajax === 'function';
+            let result;
+            if (hasJQuery) {
+                const ajaxOptions = {
+                    url,
+                    type: method,
+                    method,
+                    headers: headers || {},
+                    xhrFields: { withCredentials: true },
+                    crossDomain: false,
+                    dataType: expect === 'json' ? 'json' : 'text',
+                };
+                if (payload !== undefined && payload !== null) {
+                    const contentType = (ajaxOptions.headers['content-type'] || ajaxOptions.headers['Content-Type'] || '').toLowerCase();
+                    if (contentType.includes('application/json')) {
+                        ajaxOptions.contentType = 'application/json; charset=UTF-8';
+                        ajaxOptions.processData = false;
+                        ajaxOptions.data = JSON.stringify(payload);
+                    } else if (contentType.includes('application/x-www-form-urlencoded')) {
+                        ajaxOptions.data = new URLSearchParams(payload).toString();
+                    } else {
+                        ajaxOptions.processData = false;
+                        ajaxOptions.data = typeof payload === 'string' ? payload : JSON.stringify(payload);
+                    }
+                }
+                result = await new Promise((resolve, reject) => {
+                    ajaxOptions.success = (data) => resolve(data);
+                    ajaxOptions.error = (jqXHR, textStatus, errorThrown) => {
+                        reject({
+                            __ajax_error__: true,
+                            status: jqXHR && jqXHR.status,
+                            statusText: jqXHR && jqXHR.statusText,
+                            textStatus,
+                            errorThrown: String(errorThrown || ''),
+                            responseText: jqXHR && jqXHR.responseText ? jqXHR.responseText : '',
+                        });
+                    };
+                    window.$.ajax(ajaxOptions);
+                });
+            } else {
+                const options = { method, headers: headers || {}, credentials: 'include' };
+                if (payload !== undefined && payload !== null) {
+                    const contentType = (options.headers['content-type'] || options.headers['Content-Type'] || '').toLowerCase();
+                    if (contentType.includes('application/json')) {
+                        options.body = JSON.stringify(payload);
+                    } else if (contentType.includes('application/x-www-form-urlencoded')) {
+                        options.body = new URLSearchParams(payload).toString();
+                    } else {
+                        options.body = typeof payload === 'string' ? payload : JSON.stringify(payload);
+                    }
+                }
+                const response = await fetch(url, options);
+                const text = await response.text();
+                if (expect === 'json') {
+                    try {
+                        result = JSON.parse(text);
+                    } catch (error) {
+                        result = { __parse_error__: String(error), __raw_text__: text };
+                    }
                 } else {
-                    options.body = typeof payload === 'string' ? payload : JSON.stringify(payload);
+                    result = text;
                 }
             }
-            const response = await fetch(url, options);
-            const text = await response.text();
             if (expect === 'json') {
                 try {
-                    return JSON.parse(text);
+                    return await decryptJianyuPayload(result);
                 } catch (error) {
-                    return { __parse_error__: String(error), __raw_text__: text };
+                    if (result && typeof result === 'object') {
+                        return { ...result, __decrypt_error__: String(error) };
+                    }
+                    return { __decrypt_error__: String(error), __raw_text__: String(result || '') };
                 }
             }
-            return text;
+            return result;
         }"""
         try:
             result = page.evaluate(js, {"method": method, "url": url, "payload": payload, "headers": headers or {}, "expect": expect})
@@ -393,8 +552,7 @@ class JianyuDesktopApp:
             f"检测到验证码，请在浏览器窗口完成验证。类型={payload.get('scope') or '-'}",
         )
         self._run_on_main_thread_sync(self._bring_login_browser_to_front, target_url)
-        deadline = time.time() + 600
-        while time.time() < deadline:
+        while True:
             if self.stop_flag:
                 self.captcha_waiting = False
                 return False
@@ -404,19 +562,74 @@ class JianyuDesktopApp:
                 if "antiVerify" not in html and "textVerify" not in html and "imgData" not in html:
                     self.captcha_waiting = False
                     self._capture_page_debug(page, "manual_captcha_resolved_page", target_url)
+                    self._refresh_cookie_from_browser_if_possible()
                     self._run_on_main_thread_sync(self.status_var.set, "验证码已通过，继续抓取...")
                     return True
             except Exception:
                 pass
             time.sleep(3)
-        self.captcha_waiting = False
+
+    def _prompt_ggzy_captcha_code(self, image_path: str) -> str:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("ggzy 验证码")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        container = ttk.Frame(dialog, padding=14)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(container, text="列表接口触发验证码，请输入图片中的字符后继续。").pack(anchor="w")
+        ttk.Label(container, text=f"图片路径: {image_path}").pack(anchor="w", pady=(4, 10))
+
+        image_label = ttk.Label(container)
+        image_label.pack(anchor="center", pady=(0, 10))
+        photo = None
         try:
-            page = self._get_request_page()
-            self._capture_page_debug(page, "manual_captcha_timeout_page", target_url)
+            photo = tk.PhotoImage(file=image_path)
+            image_label.configure(image=photo)
+            image_label.image = photo
         except Exception:
-            pass
-        self._run_on_main_thread_sync(self.status_var.set, "等待人工验证码超时")
-        return False
+            image_label.configure(text="无法直接加载验证码图片，请打开图片路径查看。")
+
+        code_var = tk.StringVar(value="")
+        entry = ttk.Entry(container, textvariable=code_var, width=24)
+        entry.pack(fill="x")
+        entry.focus_set()
+
+        result = {"code": ""}
+
+        button_row = ttk.Frame(container)
+        button_row.pack(fill="x", pady=(12, 0))
+
+        def accept() -> None:
+            result["code"] = code_var.get().strip()
+            dialog.destroy()
+
+        def cancel() -> None:
+            result["code"] = ""
+            dialog.destroy()
+
+        ttk.Button(button_row, text="确定", command=accept).pack(side="right")
+        ttk.Button(button_row, text="取消", command=cancel).pack(side="right", padx=(0, 8))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.wait_window()
+        return result["code"]
+
+    def _manual_ggzy_captcha_handler(self, payload: dict) -> str:
+        image_path = str(payload.get("captcha_image_path") or "")
+        self._run_on_main_thread_sync(self.status_var.set, "ggzy 列表接口触发验证码，请手动输入。")
+        self._run_on_main_thread_sync(
+            self.progress_text_var.set,
+            f"ggzy 验证码待输入 | 图片: {os.path.basename(image_path) if image_path else '-'}",
+        )
+        self._write_diag_json("ggzy_manual_captcha_start.json", payload)
+        code = self._run_on_main_thread_sync(self._prompt_ggzy_captcha_code, image_path)
+        if code:
+            self._run_on_main_thread_sync(self.status_var.set, "ggzy 验证码已输入，继续抓取...")
+        else:
+            self._run_on_main_thread_sync(self.status_var.set, "ggzy 验证码已取消")
+        return code
 
     def _preflight_search_access(self, config: collector.SearchConfig) -> tuple[bool, dict]:
         previous_provider = collector.COOKIE_PROVIDER
@@ -572,7 +785,10 @@ class JianyuDesktopApp:
         self.progress["value"] = progress_value
 
         if stage == "search_start":
-            self.current_progress_base = "第一阶段: 准备抓取列表"
+            prefix = "第一阶段: 准备抓取列表"
+            if self.last_progress_site == "ggzy":
+                prefix = "第一阶段: 准备抓取 ggzy 列表"
+            self.current_progress_base = prefix
             self.progress_text_var.set(self.current_progress_base)
         elif stage == "search_page_start":
             self.current_progress_base = (
@@ -622,15 +838,14 @@ class JianyuDesktopApp:
                 f"第二阶段: 已补 {self.progress_current}/{self.progress_total or total} 条 | 核心完整 {self.core_projects} 个 | 正在抓取 {short_title or '-'}"
             )
             self.progress_text_var.set(self.current_progress_base)
-        elif stage in {"detail_fetch_start", "detail_fetch_done"}:
+        elif stage == "detail_fetch_done":
             short_title = title[:28] + "..." if len(title) > 28 else title
-            if stage == "detail_fetch_done":
-                self.current_detail_title = ""
-                self.current_detail_started_at = 0.0
-                self.current_progress_base = (
-                    f"第二阶段: 已补 {self.progress_current}/{self.progress_total or total} 条 | 核心完整 {self.core_projects} 个 | 预估剩余 {eta_text} | {short_title or '-'}"
-                )
-                self.progress_text_var.set(self.current_progress_base)
+            self.current_detail_title = ""
+            self.current_detail_started_at = 0.0
+            self.current_progress_base = (
+                f"第二阶段: 已补 {self.progress_current}/{self.progress_total or total} 条 | 核心完整 {self.core_projects} 个 | 预估剩余 {eta_text} | {short_title or '-'}"
+            )
+            self.progress_text_var.set(self.current_progress_base)
         else:
             self.current_progress_base = f"阶段: {stage}"
             self.progress_text_var.set(self.current_progress_base)
@@ -673,6 +888,7 @@ class JianyuDesktopApp:
         return True
 
     def _handle_progress_payload(self, payload: dict) -> None:
+        self.last_progress_site = str(payload.get("site") or "")
         self._write_run_log("__PROGRESS__" + json.dumps(payload, ensure_ascii=False) + "\n")
         self.root.after(0, self._update_progress_ui,
                         str(payload.get("stage") or ""),
@@ -701,10 +917,16 @@ class JianyuDesktopApp:
         except Exception as exc:
             self._set_summary(f"结果读取失败：{exc}")
             return
+        if "sources" in payload:
+            self._render_multi_source_summary(payload)
+            return
+        if (payload.get("meta") or {}).get("site") == "ggzy":
+            self._render_ggzy_summary(payload)
+            return
         lines: list[str] = []
         meta = payload.get("meta") or {}
         days_text = self.days_var.get().strip() or "-"
-        lines.append(f"搜索条件: 地区={self.province_var.get().strip() or '-'} | 关键词={self.keywords_var.get().strip() or '-'} | 最近天数={days_text}")
+        lines.append(f"搜索条件: 地区={self.province_var.get().strip() or '-'} | 最近天数={days_text}")
         lines.append(f"抓取记录数: {meta.get('record_count', 0)}")
         lines.append(f"项目总数: {meta.get('project_count', 0)}")
         lines.append(f"核心字段齐全项目数: {meta.get('core_analyzable_project_count', 0)}")
@@ -730,14 +952,345 @@ class JianyuDesktopApp:
             lines.append("")
         self._set_summary("\n".join(lines).strip() or "暂无结果")
 
+    def _render_ggzy_summary(self, payload: dict) -> None:
+        query = payload.get("query") or {}
+        meta = payload.get("meta") or {}
+        analysis = payload.get("analysis") or {}
+        projects = payload.get("projects") or []
+        lines: list[str] = []
+        lines.append(
+            f"搜索条件: 站点=ggzy.gov.cn | 地区={query.get('province') or '-'} | 关键词={query.get('keyword') or '-'} | 开始={query.get('begin') or '-'} | 结束={query.get('end') or '-'}"
+        )
+        lines.append(f"列表总记录数: {query.get('total_records', 0)}")
+        lines.append(f"列表总页数: {query.get('page_total', 0)}")
+        lines.append(f"项目总数: {meta.get('project_count', 0)}")
+        lines.append(f"核心字段齐全项目数: {meta.get('core_analyzable_project_count', 0)}")
+        lines.append(f"严格三文件完整项目数: {meta.get('file_complete_project_count', 0)}")
+        lines.append(f"缺全体报价但已保存项目数: {meta.get('partial_saved_project_count', 0)}")
+        lines.append(f"客户版JSON: {meta.get('customer_json_path') or '-'}")
+        lines.append("")
+        overall = analysis.get("总体统计") or {}
+        quote_stats = overall.get("报价下浮率统计") or {}
+        win_stats = overall.get("中标价下浮率统计") or {}
+        participant_stats = overall.get("参与单位数统计") or {}
+        lines.append("[整体分析]")
+        lines.append(f"报价下浮率: 最低={quote_stats.get('最低')} | 最高={quote_stats.get('最高')} | 平均={quote_stats.get('平均')}")
+        lines.append(f"中标下浮率: 最低={win_stats.get('最低')} | 最高={win_stats.get('最高')} | 平均={win_stats.get('平均')}")
+        lines.append(f"参与单位数: 最低={participant_stats.get('最低')} | 最高={participant_stats.get('最高')} | 平均={participant_stats.get('平均')}")
+        bucket_stats = analysis.get("控制价档位统计") or {}
+        for bucket_name in ["小于1000万", "1000万-2000万", "2000万-5000万", "5000万-1亿", "1亿及以上", "控制价缺失"]:
+            bucket = bucket_stats.get(bucket_name) or {}
+            lines.append(f"{bucket_name}: 项目数 {bucket.get('项目数', 0)}")
+        lines.append("")
+        core_projects = [project for project in projects if (project.get("summary") or {}).get("can_analyze_core")]
+        if not core_projects:
+            lines.append("这个时间段内没有找到核心字段齐全的项目。")
+        for index, project in enumerate(projects[:8], start=1):
+            summary = project.get("summary") or {}
+            avg_down_rate = summary.get("avg_down_rate")
+            winning_down_rate = summary.get("winning_down_rate")
+            lines.append(f"[项目 {index}] {summary.get('project_title') or project.get('project_key') or '-'}")
+            lines.append(f"文件类型: {', '.join(summary.get('notice_types_present') or []) or '-'}")
+            lines.append(f"控制价: {summary.get('control_price') if summary.get('control_price') is not None else '-'}")
+            lines.append(f"中标价: {summary.get('winning_price') if summary.get('winning_price') is not None else '-'}")
+            lines.append(f"中标单位: {summary.get('winning_company') or '-'}")
+            lines.append(f"报价家数: {summary.get('bid_quote_count', 0)}")
+            lines.append(f"平均下浮率: {f'{avg_down_rate:.4f}%' if avg_down_rate is not None else '-'}")
+            lines.append(f"中标下浮率: {f'{winning_down_rate:.4f}%' if winning_down_rate is not None else '-'}")
+            lines.append(f"缺失项: {', '.join(summary.get('issues') or []) or '无'}")
+            lines.append("")
+        self._set_summary("\n".join(lines).strip() or "暂无结果")
+
+    def _render_multi_source_summary(self, payload: dict) -> None:
+        meta = payload.get("meta") or {}
+        sources = payload.get("sources") or {}
+        lines: list[str] = []
+        lines.append(f"搜索条件: 地区={meta.get('province') or '-'} | 关键词={meta.get('keywords') or '-'} | 最近天数={meta.get('recent_days') or '-'}")
+        lines.append(f"总项目数: {meta.get('project_count', 0)}")
+        lines.append(f"核心字段齐全项目数: {meta.get('core_analyzable_project_count', 0)}")
+        lines.append(f"三文件完整项目数: {meta.get('file_complete_project_count', 0)}")
+        lines.append(f"客户版JSON: {meta.get('customer_json_path') or '-'}")
+        lines.append("")
+        for source_name in ("jianyu", "ggzy"):
+            source = sources.get(source_name) or {}
+            source_meta = source.get("meta") or {}
+            lines.append(f"[源: {source_name}]")
+            lines.append(f"项目数: {source_meta.get('project_count', 0)}")
+            lines.append(f"核心字段齐全: {source_meta.get('core_analyzable_project_count', 0)}")
+            lines.append(f"三文件完整: {source_meta.get('file_complete_project_count', 0)}")
+            lines.append(f"输出: {source_meta.get('output_json') or '-'}")
+            lines.append("")
+        self._set_summary("\n".join(lines).strip() or "暂无结果")
+
+    def _derive_source_path(self, output_path: str, suffix: str, ext: str = ".json") -> str:
+        base = output_path or os.path.join(os.path.dirname(__file__), "bid_sources_output.json")
+        root, current_ext = os.path.splitext(base)
+        if not current_ext:
+            root = base
+        return f"{root}_{suffix}{ext}"
+
+    def _customer_project_from_any_source(self, project: dict, source_name: str) -> dict:
+        summary = project.get("summary") or {}
+        quote_rows: list[dict] = []
+        for row in summary.get("bid_quote_rows") or []:
+            if not isinstance(row, dict):
+                continue
+            quote_rows.append(
+                {
+                    "单位名称": str(row.get("company") or "").strip() or "未识别单位",
+                    "报价": row.get("quote"),
+                    "下浮率": row.get("down_rate"),
+                }
+            )
+        if not quote_rows:
+            for index, quote in enumerate(summary.get("bid_quotes") or [], start=1):
+                down_rate = None
+                control_price = summary.get("control_price")
+                try:
+                    if control_price and quote:
+                        down_rate = (float(control_price) - float(quote)) / float(control_price) * 100.0
+                except Exception:
+                    down_rate = None
+                quote_rows.append({"单位名称": f"报价单位{index}", "报价": quote, "下浮率": down_rate})
+        return {
+            "数据来源": "剑鱼" if source_name == "jianyu" else "全国公共资源",
+            "项目名称": summary.get("project_title") or project.get("project_key") or "",
+            "项目编号": summary.get("bid_number") or project.get("project_code") or "",
+            "控制价档位": self._control_bucket(summary.get("control_price")),
+            "是否核心数据齐全": "是" if summary.get("can_analyze_core") else "否",
+            "是否三类文件完整": "是" if summary.get("file_complete") else "否",
+            "已有文件类型": list(summary.get("notice_types_present") or []),
+            "缺失项": list(summary.get("issues") or []),
+            "控制价": summary.get("control_price"),
+            "中标价": summary.get("winning_price"),
+            "中标单位": summary.get("winning_company") or "",
+            "中标下浮率": summary.get("winning_down_rate"),
+            "报价家数": summary.get("bid_quote_count", 0),
+            "最高报价": summary.get("bid_quote_max"),
+            "最低报价": summary.get("bid_quote_min"),
+            "平均报价": summary.get("bid_quote_avg"),
+            "最高下浮率": summary.get("max_down_rate"),
+            "最低下浮率": summary.get("min_down_rate"),
+            "平均下浮率": summary.get("avg_down_rate"),
+            "各单位报价下浮率排序": quote_rows,
+            "来源链接": list(summary.get("source_urls") or []),
+        }
+
+    def _control_bucket(self, control_price) -> str:
+        try:
+            if control_price is None:
+                return "控制价缺失"
+            value = float(control_price)
+        except Exception:
+            return "控制价缺失"
+        if value < 10_000_000:
+            return "小于1000万"
+        if value < 20_000_000:
+            return "1000万-2000万"
+        if value < 50_000_000:
+            return "2000万-5000万"
+        if value < 100_000_000:
+            return "5000万-1亿"
+        return "1亿及以上"
+
+    def _numeric_stats(self, values: list) -> dict:
+        clean_values: list[float] = []
+        for value in values:
+            if value is None:
+                continue
+            try:
+                clean_values.append(float(value))
+            except Exception:
+                continue
+        if not clean_values:
+            return {"样本数": 0, "最低": None, "最高": None, "平均": None}
+        return {
+            "样本数": len(clean_values),
+            "最低": min(clean_values),
+            "最高": max(clean_values),
+            "平均": sum(clean_values) / len(clean_values),
+        }
+
+    def _count_stats(self, values: list) -> dict:
+        stats = self._numeric_stats(values)
+        for key in ("最低", "最高"):
+            if stats[key] is not None:
+                stats[key] = int(stats[key])
+        return stats
+
+    def _build_combined_analysis(self, projects: list[dict]) -> dict:
+        bucket_names = ["小于1000万", "1000万-2000万", "2000万-5000万", "5000万-1亿", "1亿及以上", "控制价缺失"]
+        buckets = {
+            name: {
+                "控制价": [],
+                "中标价下浮率": [],
+                "报价下浮率": [],
+                "参与单位数": [],
+                "项目数": 0,
+            }
+            for name in bucket_names
+        }
+        all_control_prices: list = []
+        all_winning_down_rates: list = []
+        all_quote_down_rates: list = []
+        all_participant_counts: list = []
+        for project in projects:
+            summary = project.get("summary") or {}
+            bucket = self._control_bucket(summary.get("control_price"))
+            buckets.setdefault(bucket, {"控制价": [], "中标价下浮率": [], "报价下浮率": [], "参与单位数": [], "项目数": 0})
+            buckets[bucket]["项目数"] += 1
+            control_price = summary.get("control_price")
+            if control_price is not None:
+                buckets[bucket]["控制价"].append(control_price)
+                all_control_prices.append(control_price)
+            winning_down_rate = summary.get("winning_down_rate")
+            if winning_down_rate is not None:
+                buckets[bucket]["中标价下浮率"].append(winning_down_rate)
+                all_winning_down_rates.append(winning_down_rate)
+            quote_down_rates = [
+                row.get("down_rate")
+                for row in summary.get("bid_quote_rows") or []
+                if isinstance(row, dict) and row.get("down_rate") is not None
+            ]
+            buckets[bucket]["报价下浮率"].extend(quote_down_rates)
+            all_quote_down_rates.extend(quote_down_rates)
+            participant_count = summary.get("bid_quote_count")
+            if participant_count is not None:
+                buckets[bucket]["参与单位数"].append(participant_count)
+                all_participant_counts.append(participant_count)
+        return {
+            "控制价档位统计": {
+                name: {
+                    "项目数": buckets[name]["项目数"],
+                    "控制价统计": self._numeric_stats(buckets[name]["控制价"]),
+                    "中标价下浮率统计": self._numeric_stats(buckets[name]["中标价下浮率"]),
+                    "报价下浮率统计": self._numeric_stats(buckets[name]["报价下浮率"]),
+                    "参与单位数统计": self._count_stats(buckets[name]["参与单位数"]),
+                }
+                for name in bucket_names
+            },
+            "总体统计": {
+                "控制价统计": self._numeric_stats(all_control_prices),
+                "报价下浮率统计": self._numeric_stats(all_quote_down_rates),
+                "中标价下浮率统计": self._numeric_stats(all_winning_down_rates),
+                "参与单位数统计": self._count_stats(all_participant_counts),
+                "有控制价项目数": len(all_control_prices),
+                "有中标下浮率项目数": len(all_winning_down_rates),
+                "有报价明细项目数": sum(1 for item in projects if (item.get("summary") or {}).get("bid_quote_rows")),
+            },
+        }
+
+    def _write_multi_source_output(
+        self,
+        output_path: str,
+        *,
+        keywords: str,
+        province: str,
+        recent_days: int,
+        jianyu_payload: dict | None,
+        ggzy_payload: dict | None,
+        jianyu_error: str = "",
+        ggzy_error: str = "",
+        jianyu_output: str = "",
+        ggzy_output: str = "",
+    ) -> dict:
+        projects: list[dict] = []
+        for source_name, payload in (("jianyu", jianyu_payload), ("ggzy", ggzy_payload)):
+            if not payload:
+                continue
+            for project in payload.get("projects") or []:
+                item = dict(project)
+                item["source_site"] = source_name
+                projects.append(item)
+
+        def meta_int(payload: dict | None, key: str) -> int:
+            try:
+                return int(((payload or {}).get("meta") or {}).get(key) or 0)
+            except Exception:
+                return 0
+
+        customer_json_path = self._derive_source_path(output_path, "客户版")
+        output_payload = {
+            "meta": {
+                "site": "multi",
+                "sources": ["jianyu", "ggzy"],
+                "keywords": keywords,
+                "province": province,
+                "recent_days": recent_days,
+                "project_count": len(projects),
+                "core_analyzable_project_count": meta_int(jianyu_payload, "core_analyzable_project_count") + meta_int(ggzy_payload, "core_analyzable_project_count"),
+                "file_complete_project_count": meta_int(jianyu_payload, "file_complete_project_count") + meta_int(ggzy_payload, "file_complete_project_count"),
+                "customer_json_path": customer_json_path,
+            },
+            "sources": {
+                "jianyu": {
+                    "ok": jianyu_payload is not None and not jianyu_error,
+                    "error": jianyu_error,
+                    "meta": {
+                        **((jianyu_payload or {}).get("meta") or {}),
+                        "output_json": jianyu_output,
+                    },
+                    "payload": jianyu_payload,
+                },
+                "ggzy": {
+                    "ok": ggzy_payload is not None and not ggzy_error,
+                    "error": ggzy_error,
+                    "meta": {
+                        **((ggzy_payload or {}).get("meta") or {}),
+                        "output_json": ggzy_output,
+                    },
+                    "payload": ggzy_payload,
+                },
+            },
+            "projects": projects,
+        }
+        with open(output_path, "w", encoding="utf-8") as fp:
+            json.dump(output_payload, fp, ensure_ascii=False, indent=2)
+        customer_payload = {
+            "说明": "这是给客户查看的双源合并结果，只保留中文字段、状态和核心数字。",
+            "抓取条件": {
+                "关键词": keywords,
+                "地区": province,
+                "最近天数": recent_days,
+            },
+            "汇总": {
+                "项目总数": output_payload["meta"]["project_count"],
+                "核心字段齐全项目数": output_payload["meta"]["core_analyzable_project_count"],
+                "三文件完整项目数": output_payload["meta"]["file_complete_project_count"],
+            },
+            "来源": {
+                "剑鱼": {
+                    "是否成功": "是" if output_payload["sources"]["jianyu"]["ok"] else "否",
+                    "错误": jianyu_error,
+                    "项目数": meta_int(jianyu_payload, "project_count"),
+                    "核心字段齐全项目数": meta_int(jianyu_payload, "core_analyzable_project_count"),
+                },
+                "全国公共资源": {
+                    "是否成功": "是" if output_payload["sources"]["ggzy"]["ok"] else "否",
+                    "错误": ggzy_error,
+                    "项目数": meta_int(ggzy_payload, "project_count"),
+                    "核心字段齐全项目数": meta_int(ggzy_payload, "core_analyzable_project_count"),
+                },
+            },
+            "分析": self._build_combined_analysis(projects),
+            "项目列表": [
+                self._customer_project_from_any_source(project, str(project.get("source_site") or ""))
+                for project in projects
+            ],
+        }
+        with open(customer_json_path, "w", encoding="utf-8") as fp:
+            json.dump(customer_payload, fp, ensure_ascii=False, indent=2)
+        return output_payload
+
+    @staticmethod
+    def _is_expected_stop_exception(exc: Exception) -> bool:
+        return str(exc) == "collection stopped"
+
     def run_capture(self) -> None:
         if self.collection_running:
             messagebox.showinfo("提示", "任务正在运行。")
             return
-        keywords = self.keywords_var.get().strip()
-        if not keywords:
-            messagebox.showwarning("提示", "请输入项目关键词。")
-            return
+        keywords = ""
         days_text = self.days_var.get().strip()
         try:
             recent_days = int(days_text)
@@ -751,49 +1304,36 @@ class JianyuDesktopApp:
         keep_browser_session = self.keep_browser_session_var.get()
         cookie_path = self.cookie_var.get().strip()
         output = self.output_var.get().strip()
-        report = self.report_var.get().strip()
-        if keep_browser_session and self.login_context is None:
-            messagebox.showwarning("提示", "当前已勾选“复用当前登录浏览器会话”，请先点“打开登录页”并在浏览器里完成登录/验证码。")
-            return
         if not cookie_path or not os.path.exists(cookie_path):
-            messagebox.showwarning("提示", "请选择有效的 cookie 文件。")
+            messagebox.showwarning("提示", "请选择有效的剑鱼 Cookie 文件。全国公共资源不需要 Cookie，但剑鱼需要。")
             return
         try:
             self._refresh_cookie_from_browser_if_possible()
         except Exception as exc:
-            messagebox.showwarning("提示", f"无法从当前浏览器会话刷新登录态，将继续使用现有 Cookie 文件。\n原因：{exc}")
-        cmd = [
-            sys.executable,
-            SCRIPT_PATH,
-            "--keywords", keywords,
-            "--province", province,
-            "--recent-days", str(recent_days),
-            "--cookie-file", cookie_path,
-            "--output", output,
-            "--fetch-details",
-            "--detail-limit", "120",
-            "--captcha-auto-attempts", "3",
-        ]
-        if report:
-            cmd.extend(["--report-md", report])
-        run_mode = "同一浏览器会话抓取" if keep_browser_session and self.login_context is not None else "Cookie 文件抓取"
+            messagebox.showwarning("提示", f"无法从当前浏览器会话刷新剑鱼登录态，将继续使用现有 Cookie 文件。\n原因：{exc}")
+        jianyu_output = self._derive_source_path(output, "jianyu")
+        ggzy_output = self._derive_source_path(output, "ggzy")
+        run_mode = "双源抓取：剑鱼使用登录态，全国公共资源使用公开接口"
         self._start_run_diagnostics()
         self._write_diag_json(
             "run_context.json",
             {
+                "site": "multi",
+                "sources": ["jianyu", "ggzy"],
                 "keywords": keywords,
                 "province": province,
                 "recent_days": recent_days,
                 "cookie_path": cookie_path,
                 "output": output,
-                "report": report,
+                "jianyu_output": jianyu_output,
+                "ggzy_output": ggzy_output,
                 "keep_browser_session": keep_browser_session,
                 "login_context_ready": self.login_context is not None,
                 "mode": run_mode,
             },
         )
         self._append_log(f"[模式] {run_mode}\n")
-        self._append_log(f"$ {' '.join(cmd)}\n")
+        self._append_log(f"[输出] 合并={output} | 剑鱼={jianyu_output} | 全国公共资源={ggzy_output}\n")
         self.run_started_at = time.time()
         self.progress_total = 0
         self.progress_current = 0
@@ -816,7 +1356,12 @@ class JianyuDesktopApp:
         self.root.after(1000, self._tick_runtime_feedback)
 
         def worker() -> None:
+            jianyu_payload = None
+            ggzy_payload = None
+            jianyu_error = ""
+            ggzy_error = ""
             try:
+                self._run_on_main_thread_sync(self.status_var.set, "运行中：正在抓取剑鱼...")
                 config = collector.SearchConfig(
                     keywords=keywords,
                     province=province,
@@ -825,72 +1370,151 @@ class JianyuDesktopApp:
                     page_size=50,
                     max_pages=20,
                     cookie_file=cookie_path,
-                    output=output,
-                    report_md=report,
+                    output=jianyu_output,
+                    report_md="",
                     fetch_details=True,
                     detail_limit=120,
-                    captcha_auto_attempts=3,
+                    source_mode="area_listing",
                 )
-                if keep_browser_session and self.login_context is not None:
-                    preflight_ok, preflight = self._run_on_main_thread_sync(self._preflight_search_access, config)
-                    self._run_on_main_thread_sync(self._append_log, "[预检] " + json.dumps(preflight, ensure_ascii=False) + "\n")
-                    if not preflight_ok:
-                        if preflight.get("has_captcha"):
-                            resumed = self._manual_captcha_handler(
-                                {
-                                    "scope": "preflight_search",
-                                    "url": LOGIN_URL,
-                                    "message": "预检触发验证码，等待人工处理后重新预检。",
-                                }
-                            )
-                            if resumed:
-                                preflight_ok, preflight = self._run_on_main_thread_sync(self._preflight_search_access, config)
-                                self._run_on_main_thread_sync(self._append_log, "[预检重试] " + json.dumps(preflight, ensure_ascii=False) + "\n")
-                                if not preflight_ok:
-                                    self._run_on_main_thread_sync(self.status_var.set, "预检未通过：人工验证后仍未放行")
-                                    self._run_on_main_thread_sync(
-                                        self.progress_text_var.set,
-                                        "你已完成一次人工验证，但搜索接口仍未放行，当前任务未进入正式抓取。",
-                                    )
-                                    self._run_on_main_thread_sync(self._finish, "预检未通过")
-                                    return
-                            else:
-                                self._run_on_main_thread_sync(self.status_var.set, "预检未通过：未完成人工验证码")
-                                self._run_on_main_thread_sync(
-                                    self.progress_text_var.set,
-                                    "预检检测到验证码，当前已停止。请在浏览器完成验证后重新开始。",
-                                )
-                                self._run_on_main_thread_sync(self._finish, "预检未通过")
-                                return
-                        self._run_on_main_thread_sync(self._finish, "预检失败：搜索页不可用")
-                        return
-                previous_provider = collector.COOKIE_PROVIDER
-                previous_callback = collector.PROGRESS_CALLBACK
-                previous_stop = collector.STOP_REQUESTED
-                previous_browser_provider = collector.BROWSER_REQUEST_PROVIDER
-                previous_rendered_provider = collector.BROWSER_RENDERED_PROVIDER
-                previous_manual_captcha = collector.MANUAL_CAPTCHA_HANDLER
-                reuse_live_session = keep_browser_session and self.login_context is not None
-                collector.COOKIE_PROVIDER = self._build_cookie_string if reuse_live_session else None
-                collector.PROGRESS_CALLBACK = self._handle_progress_payload
-                collector.STOP_REQUESTED = lambda: self.stop_flag
-                collector.BROWSER_REQUEST_PROVIDER = self._browser_request if reuse_live_session else None
-                collector.BROWSER_RENDERED_PROVIDER = self._browser_rendered_payload if reuse_live_session else None
-                collector.MANUAL_CAPTCHA_HANDLER = self._manual_captcha_handler if reuse_live_session else None
                 try:
-                    output_payload = collector.run_collection(config)
-                finally:
-                    collector.COOKIE_PROVIDER = previous_provider
-                    collector.PROGRESS_CALLBACK = previous_callback
-                    collector.STOP_REQUESTED = previous_stop
-                    collector.BROWSER_REQUEST_PROVIDER = previous_browser_provider
-                    collector.BROWSER_RENDERED_PROVIDER = previous_rendered_provider
-                    collector.MANUAL_CAPTCHA_HANDLER = previous_manual_captcha
+                    previous_provider = collector.COOKIE_PROVIDER
+                    previous_callback = collector.PROGRESS_CALLBACK
+                    previous_stop = collector.STOP_REQUESTED
+                    previous_browser_provider = collector.BROWSER_REQUEST_PROVIDER
+                    previous_rendered_provider = collector.BROWSER_RENDERED_PROVIDER
+                    previous_manual_captcha = collector.MANUAL_CAPTCHA_HANDLER
+                    reuse_live_session = keep_browser_session and self.login_context is not None
+                    collector.COOKIE_PROVIDER = self._build_cookie_string if reuse_live_session else None
+                    collector.PROGRESS_CALLBACK = self._handle_progress_payload
+                    collector.STOP_REQUESTED = lambda: self.stop_flag
+                    collector.BROWSER_REQUEST_PROVIDER = self._browser_request if reuse_live_session else None
+                    collector.BROWSER_RENDERED_PROVIDER = self._browser_rendered_payload if reuse_live_session else None
+                    collector.MANUAL_CAPTCHA_HANDLER = self._manual_captcha_handler if reuse_live_session else None
+                    try:
+                        jianyu_payload = collector.run_collection(config)
+                    finally:
+                        collector.COOKIE_PROVIDER = previous_provider
+                        collector.PROGRESS_CALLBACK = previous_callback
+                        collector.STOP_REQUESTED = previous_stop
+                        collector.BROWSER_REQUEST_PROVIDER = previous_browser_provider
+                        collector.BROWSER_RENDERED_PROVIDER = previous_rendered_provider
+                        collector.MANUAL_CAPTCHA_HANDLER = previous_manual_captcha
+                    self._run_on_main_thread_sync(self._append_log, "[剑鱼完成] " + json.dumps((jianyu_payload or {}).get("meta") or {}, ensure_ascii=False) + "\n")
+                except Exception as exc:
+                    jianyu_error = "" if self._is_expected_stop_exception(exc) else str(exc)
+                    if os.path.exists(jianyu_output):
+                        try:
+                            with open(jianyu_output, "r", encoding="utf-8") as fp:
+                                jianyu_payload = json.load(fp)
+                        except Exception:
+                            pass
+                    if jianyu_error:
+                        self._write_diag_json(
+                            "jianyu_source_error.json",
+                            {
+                                "error": jianyu_error,
+                                "traceback": traceback.format_exc(),
+                            },
+                        )
+                        self._run_on_main_thread_sync(self._append_log, f"[剑鱼失败] {jianyu_error}\n{traceback.format_exc()}\n")
+                    else:
+                        self._run_on_main_thread_sync(self._append_log, "[剑鱼停止] 已收到停止请求，已保留当前结果。\n")
                 if self.stop_flag:
-                    self._enqueue_ui(self._finish, "已停止")
-                else:
+                    self._write_multi_source_output(
+                        output,
+                        keywords=keywords,
+                        province=province,
+                        recent_days=recent_days,
+                        jianyu_payload=jianyu_payload,
+                        ggzy_payload=ggzy_payload,
+                        jianyu_error=jianyu_error,
+                        ggzy_error=ggzy_error,
+                        jianyu_output=jianyu_output,
+                        ggzy_output=ggzy_output,
+                    )
                     self._enqueue_ui(self._render_summary_from_output, output)
-                    self._enqueue_ui(self._append_log, json.dumps(output_payload.get("meta") or {}, ensure_ascii=False, indent=2) + "\n")
+                    self._enqueue_ui(self._finish, "已停止，已保存当前结果")
+                    return
+
+                self._run_on_main_thread_sync(self.status_var.set, "运行中：正在抓取全国公共资源...")
+                previous_callback = ggzy_collector.PROGRESS_CALLBACK
+                previous_stop = ggzy_collector.STOP_REQUESTED
+                previous_captcha = ggzy_collector.CAPTCHA_HANDLER
+                ggzy_collector.PROGRESS_CALLBACK = self._handle_progress_payload
+                ggzy_collector.STOP_REQUESTED = lambda: self.stop_flag
+                ggzy_collector.CAPTCHA_HANDLER = self._manual_ggzy_captcha_handler
+                try:
+                    ggzy_config = ggzy_collector.CrawlConfig(
+                        province=province,
+                        days=recent_days,
+                        keyword=keywords,
+                        max_pages=20,
+                        output_json=ggzy_output,
+                    )
+                    ggzy_payload = ggzy_collector.crawl(ggzy_config)
+                    with open(ggzy_output, "w", encoding="utf-8") as fp:
+                        json.dump(ggzy_payload, fp, ensure_ascii=False, indent=2)
+                    self._run_on_main_thread_sync(self._append_log, "[全国公共资源完成] " + json.dumps((ggzy_payload or {}).get("query") or {}, ensure_ascii=False) + "\n")
+                except Exception as exc:
+                    ggzy_error = "" if self._is_expected_stop_exception(exc) else str(exc)
+                    if os.path.exists(ggzy_output):
+                        try:
+                            with open(ggzy_output, "r", encoding="utf-8") as fp:
+                                ggzy_payload = json.load(fp)
+                        except Exception:
+                            pass
+                    if ggzy_error:
+                        self._write_diag_json(
+                            "ggzy_source_error.json",
+                            {
+                                "error": ggzy_error,
+                                "traceback": traceback.format_exc(),
+                            },
+                        )
+                        self._run_on_main_thread_sync(self._append_log, f"[全国公共资源失败] {ggzy_error}\n{traceback.format_exc()}\n")
+                    else:
+                        self._run_on_main_thread_sync(self._append_log, "[全国公共资源停止] 已收到停止请求，已保留当前结果。\n")
+                finally:
+                    ggzy_collector.PROGRESS_CALLBACK = previous_callback
+                    ggzy_collector.STOP_REQUESTED = previous_stop
+                    ggzy_collector.CAPTCHA_HANDLER = previous_captcha
+
+                if self.stop_flag:
+                    self._write_multi_source_output(
+                        output,
+                        keywords=keywords,
+                        province=province,
+                        recent_days=recent_days,
+                        jianyu_payload=jianyu_payload,
+                        ggzy_payload=ggzy_payload,
+                        jianyu_error=jianyu_error,
+                        ggzy_error=ggzy_error,
+                        jianyu_output=jianyu_output,
+                        ggzy_output=ggzy_output,
+                    )
+                    self._enqueue_ui(self._render_summary_from_output, output)
+                    self._enqueue_ui(self._finish, "已停止，已保存当前结果")
+                    return
+                self._write_multi_source_output(
+                    output,
+                    keywords=keywords,
+                    province=province,
+                    recent_days=recent_days,
+                    jianyu_payload=jianyu_payload,
+                    ggzy_payload=ggzy_payload,
+                    jianyu_error=jianyu_error,
+                    ggzy_error=ggzy_error,
+                    jianyu_output=jianyu_output,
+                    ggzy_output=ggzy_output,
+                )
+                self._enqueue_ui(self._render_summary_from_output, output)
+                if jianyu_error and ggzy_error:
+                    self._enqueue_ui(self._finish, "失败：两个来源都失败")
+                elif jianyu_error:
+                    self._enqueue_ui(self._finish, "部分完成：剑鱼失败")
+                elif ggzy_error:
+                    self._enqueue_ui(self._finish, "部分完成：全国公共资源失败")
+                else:
                     self._enqueue_ui(self._finish, "完成")
             except Exception as exc:
                 self._enqueue_ui(self._finish, f"失败：{exc}")
