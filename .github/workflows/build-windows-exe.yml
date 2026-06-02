@@ -89,6 +89,23 @@ jobs:
             --hidden-import numpy `
             jianyu_desktop.py
 
+      - name: Smoke Test Built EXEs
+        shell: pwsh
+        run: |
+          $bid = Start-Process -FilePath "dist/bid_simulator.exe" -PassThru
+          Start-Sleep -Seconds 8
+          if ($bid.HasExited) {
+            throw "bid_simulator.exe exited during startup. Check packaging/runtime dependencies."
+          }
+          Stop-Process -Id $bid.Id -Force
+
+          $jianyu = Start-Process -FilePath "dist/jianyu_desktop/jianyu_desktop.exe" -PassThru
+          Start-Sleep -Seconds 8
+          if ($jianyu.HasExited) {
+            throw "jianyu_desktop.exe exited during startup. Check packaging/runtime dependencies."
+          }
+          Stop-Process -Id $jianyu.Id -Force
+
       - name: Package Jianyu Desktop Folder
         shell: pwsh
         run: |
