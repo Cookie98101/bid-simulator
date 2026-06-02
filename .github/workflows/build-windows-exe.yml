@@ -34,6 +34,11 @@ jobs:
             requests `
             beautifulsoup4
 
+      - name: Smoke Test Python Imports
+        shell: pwsh
+        run: |
+          python -c "import requests, bs4, cryptography, cv2, numpy, sklearn, playwright; import ggzy_gov_collector; import jianyu_project_collector; import jianyu_desktop; print('python import smoke test passed')"
+
       - name: Install Playwright Browsers
         shell: pwsh
         run: |
@@ -61,10 +66,26 @@ jobs:
             --collect-all cryptography `
             --collect-all requests `
             --collect-all bs4 `
+            --collect-all urllib3 `
+            --collect-all certifi `
+            --collect-all charset_normalizer `
+            --collect-all idna `
+            --collect-all soupsieve `
             --collect-all PIL `
             --collect-all cv2 `
             --hidden-import sklearn `
             --hidden-import sklearn.cluster `
+            --hidden-import requests `
+            --hidden-import requests.adapters `
+            --hidden-import requests.sessions `
+            --hidden-import requests.models `
+            --hidden-import bs4 `
+            --hidden-import bs4.builder `
+            --hidden-import urllib3 `
+            --hidden-import certifi `
+            --hidden-import charset_normalizer `
+            --hidden-import idna `
+            --hidden-import soupsieve `
             --hidden-import numpy `
             jianyu_desktop.py
 
