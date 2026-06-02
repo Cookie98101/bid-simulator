@@ -30,7 +30,9 @@ jobs:
             numpy `
             opencv-python-headless `
             scikit-learn `
-            cryptography
+            cryptography `
+            requests `
+            beautifulsoup4
 
       - name: Install Playwright Browsers
         shell: pwsh
@@ -57,6 +59,8 @@ jobs:
             --name jianyu_desktop `
             --collect-all playwright `
             --collect-all cryptography `
+            --collect-all requests `
+            --collect-all bs4 `
             --collect-all PIL `
             --collect-all cv2 `
             --hidden-import sklearn `
