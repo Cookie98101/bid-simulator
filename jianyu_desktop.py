@@ -756,6 +756,10 @@ class JianyuDesktopApp:
         collected_records: int = 0,
         grouped_projects: int = 0,
         core_projects: int = 0,
+        message: str = "",
+        url: str = "",
+        seconds: float = 0.0,
+        reason: str = "",
     ) -> None:
         self.last_progress_at = time.time()
         elapsed = max(0.0, time.time() - self.run_started_at) if self.run_started_at else 0.0
@@ -831,6 +835,22 @@ class JianyuDesktopApp:
             self.current_progress_base = "验证码已人工通过，继续抓取"
             self.progress_text_var.set(self.current_progress_base)
             self.status_var.set("验证码已通过，继续抓取...")
+        elif stage == "rate_limit_wait":
+            reason_text = "验证码冷却" if reason == "captcha_cooldown" else "请求间隔"
+            self.current_progress_base = f"等待中: {reason_text} {self._format_eta(seconds)} | 不是卡死"
+            self.progress_text_var.set(self.current_progress_base)
+        elif stage == "request_start":
+            short_url = url[:92] + "..." if len(url) > 92 else url
+            self.current_progress_base = f"请求中: {short_url or '-'}"
+            self.progress_text_var.set(self.current_progress_base)
+        elif stage == "request_done":
+            short_url = url[:72] + "..." if len(url) > 72 else url
+            self.current_progress_base = f"请求完成: 用时 {self._format_eta(seconds)} | {short_url or '-'}"
+            self.progress_text_var.set(self.current_progress_base)
+        elif stage == "request_error":
+            short_url = url[:72] + "..." if len(url) > 72 else url
+            self.current_progress_base = f"请求失败: {message or '-'} | {short_url or '-'}"
+            self.progress_text_var.set(self.current_progress_base)
         elif stage == "detail_fetch_start":
             self.current_detail_title = short_title = title[:28] + "..." if len(title) > 28 else title
             self.current_detail_started_at = time.time()
@@ -900,7 +920,11 @@ class JianyuDesktopApp:
                         int(payload.get("page_items") or 0),
                         int(payload.get("collected_records") or 0),
                         int(payload.get("grouped_projects") or 0),
-                        int(payload.get("core_projects") or 0))
+                        int(payload.get("core_projects") or 0),
+                        str(payload.get("message") or payload.get("error") or ""),
+                        str(payload.get("url") or ""),
+                        float(payload.get("seconds") or payload.get("elapsed_seconds") or 0.0),
+                        str(payload.get("reason") or ""))
 
     def _set_summary(self, text: str) -> None:
         self.summary.configure(state="normal")
@@ -1389,7 +1413,7 @@ class JianyuDesktopApp:
                     collector.STOP_REQUESTED = lambda: self.stop_flag
                     collector.BROWSER_REQUEST_PROVIDER = self._browser_request if reuse_live_session else None
                     collector.BROWSER_RENDERED_PROVIDER = self._browser_rendered_payload if reuse_live_session else None
-                    collector.MANUAL_CAPTCHA_HANDLER = self._manual_captcha_handler if reuse_live_session else None
+                    collector.MANUAL_CAPTCHA_HANDLER = self._manual_captcha_handler
                     try:
                         jianyu_payload = collector.run_collection(config)
                     finally:

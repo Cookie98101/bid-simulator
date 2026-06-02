@@ -1665,20 +1665,29 @@ def post_form_json(url: str, payload: dict[str, Any], cookie: str, extra_headers
 
 def fetch_html(url: str, cookie: str) -> str:
     abort_if_requested()
+    started_at = time.time()
+    emit_progress("request_start", method="GET", url=url)
     apply_detail_rate_limit()
-    browser_result = browser_request("GET", url, None, None, "text")
-    if isinstance(browser_result, str):
-        return browser_result
-    cookie = resolve_cookie(cookie)
-    headers = {
-        "user-agent": "Mozilla/5.0",
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    if cookie:
-        headers["cookie"] = cookie
-    request = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read().decode("utf-8", errors="replace")
+    try:
+        browser_result = browser_request("GET", url, None, None, "text")
+        if isinstance(browser_result, str):
+            emit_progress("request_done", method="GET", url=url, elapsed_seconds=round(time.time() - started_at, 1), via="browser")
+            return browser_result
+        cookie = resolve_cookie(cookie)
+        headers = {
+            "user-agent": "Mozilla/5.0",
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        if cookie:
+            headers["cookie"] = cookie
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            text = response.read().decode("utf-8", errors="replace")
+            emit_progress("request_done", method="GET", url=url, elapsed_seconds=round(time.time() - started_at, 1), via="urllib")
+            return text
+    except Exception as exc:
+        emit_progress("request_error", method="GET", url=url, elapsed_seconds=round(time.time() - started_at, 1), error=str(exc))
+        raise
 
 
 def fetch_detail_preagent(url: str, cookie: str) -> dict[str, Any]:
@@ -1724,16 +1733,25 @@ def fetch_detail_baseinfo(url: str, sid: str, token: str, cookie: str) -> dict[s
 
 
 def apply_rate_limit(state: dict[str, Any], min_gap_range: tuple[float, float]) -> None:
+    def sleep_interruptibly(seconds: float) -> None:
+        deadline = time.time() + max(0.0, seconds)
+        while time.time() < deadline:
+            abort_if_requested()
+            time.sleep(min(1.0, deadline - time.time()))
+
     now = time.time()
     cooldown_until = float(state.get("cooldown_until") or 0.0)
     if cooldown_until > now:
-        time.sleep(cooldown_until - now)
+        wait_seconds = cooldown_until - now
+        emit_progress("rate_limit_wait", seconds=round(wait_seconds, 1), reason="captcha_cooldown")
+        sleep_interruptibly(wait_seconds)
         now = time.time()
     last_fetch_ts = float(state.get("last_fetch_ts") or 0.0)
     min_gap = random.uniform(*min_gap_range)
     wait_needed = min_gap - (now - last_fetch_ts)
     if wait_needed > 0:
-        time.sleep(wait_needed)
+        emit_progress("rate_limit_wait", seconds=round(wait_needed, 1), reason="request_interval")
+        sleep_interruptibly(wait_needed)
     state["last_fetch_ts"] = time.time()
 
 
