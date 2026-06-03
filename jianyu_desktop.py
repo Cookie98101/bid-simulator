@@ -11,6 +11,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 import jianyu_project_collector as collector
 import ggzy_gov_collector as ggzy_collector
+from customer_json_utils import write_customer_json_splits
 
 
 SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "jianyu_project_collector.py")
@@ -23,6 +24,16 @@ def app_state_dir() -> str:
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or os.getcwd()
         return os.path.join(base, "JianyuDesktop")
     return os.path.join("/tmp", "jianyu_desktop")
+
+
+def default_output_path() -> str:
+    home_dir = os.path.expanduser("~")
+    desktop_dir = os.path.join(home_dir, "Desktop")
+    if os.path.isdir(desktop_dir):
+        return os.path.join(desktop_dir, "bid_sources_output.json")
+    if os.path.isdir(home_dir):
+        return os.path.join(home_dir, "bid_sources_output.json")
+    return os.path.join(os.path.dirname(__file__), "bid_sources_output.json")
 
 
 APP_STATE_DIR = app_state_dir()
@@ -49,6 +60,7 @@ class JianyuDesktopApp:
         self.collection_running = False
         self.worker_thread = None
         self.stop_flag = False
+        self.shutting_down = False
         self.playwright = None
         self.login_context = None
         self.login_page = None
@@ -78,7 +90,7 @@ class JianyuDesktopApp:
         os.makedirs(APP_STATE_DIR, exist_ok=True)
         os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
         self.cookie_var = tk.StringVar(value=DEFAULT_COOKIE_PATH)
-        self.output_var = tk.StringVar(value=os.path.join(os.path.dirname(__file__), "bid_sources_output.json"))
+        self.output_var = tk.StringVar(value=default_output_path())
         self.status_var = tk.StringVar(value="就绪")
         self.progress_text_var = tk.StringVar(value="暂无进度")
 
@@ -113,7 +125,7 @@ class JianyuDesktopApp:
         self.save_login_button = ttk.Button(self.cookie_actions, text="保存登录态", command=self._save_login_state)
         self.save_login_button.pack(side="left", padx=(8, 0))
 
-        ttk.Label(top, text="输出 JSON").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(top, text="输出数据库 JSON").grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(top, textvariable=self.output_var, width=72).grid(row=2, column=1, columnspan=3, sticky="we", padx=8, pady=(10, 0))
         ttk.Button(top, text="选择", command=self._pick_output).grid(row=2, column=4, padx=(0, 8), pady=(10, 0))
 
@@ -171,13 +183,14 @@ class JianyuDesktopApp:
             self.output_var.set(path)
 
     def _on_site_changed(self) -> None:
-        base_dir = os.path.dirname(__file__)
         self.root.title("投标项目抓取器 - 双源版")
         if not self.output_var.get().strip():
-            self.output_var.set(os.path.join(base_dir, "bid_sources_output.json"))
+            self.output_var.set(default_output_path())
         self.status_var.set("就绪：默认同时抓取剑鱼和全国公共资源，Cookie 只用于剑鱼。")
 
     def _launch_login_context(self) -> None:
+        if self.shutting_down:
+            raise RuntimeError("application is closing")
         if self.login_context is not None:
             if self.login_page is not None:
                 try:
@@ -273,6 +286,8 @@ class JianyuDesktopApp:
             pass
 
     def _get_request_page(self):
+        if self.shutting_down:
+            raise RuntimeError("application is closing")
         self._launch_login_context()
         if self.login_context is None:
             raise RuntimeError("登录浏览器尚未打开。")
@@ -487,6 +502,17 @@ class JianyuDesktopApp:
         page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
         return page.content()
 
+    def _browser_current_page_state(self, page) -> dict:
+        try:
+            current_url = page.url or ""
+        except Exception:
+            current_url = ""
+        try:
+            html = page.content()
+        except Exception as exc:
+            html = f"<capture-error>{exc}</capture-error>"
+        return {"url": current_url, "html": html}
+
     def _browser_rendered_payload(self, url: str) -> dict:
         if threading.get_ident() != self.main_thread_id:
             return self._run_on_main_thread_sync(self._browser_rendered_payload, url)
@@ -557,13 +583,27 @@ class JianyuDesktopApp:
                 self.captcha_waiting = False
                 return False
             try:
-                page = self._get_request_page()
-                html = self._run_on_main_thread_sync(self._browser_page_content, page, target_url)
+                page = self.login_page
+                if page is None:
+                    self._run_on_main_thread_sync(self._launch_login_context)
+                    page = self.login_page
+                if page is None:
+                    time.sleep(3)
+                    continue
+                state = self._run_on_main_thread_sync(self._browser_current_page_state, page)
+                current_url = str(state.get("url") or "")
+                html = str(state.get("html") or "")
                 if "antiVerify" not in html and "textVerify" not in html and "imgData" not in html:
                     self.captcha_waiting = False
-                    self._capture_page_debug(page, "manual_captcha_resolved_page", target_url)
-                    self._refresh_cookie_from_browser_if_possible()
-                    self._run_on_main_thread_sync(self.status_var.set, "验证码已通过，继续抓取...")
+                    self._run_on_main_thread_sync(self._capture_page_debug, page, "manual_captcha_resolved_page", target_url)
+                    self._run_on_main_thread_sync(self._refresh_cookie_from_browser_if_possible)
+                    if "/front/notFind" in current_url or "该页面信息不存在" in html:
+                        self._run_on_main_thread_sync(
+                            self.status_var.set,
+                            "验证码已处理，当前详情页不存在，跳过继续...",
+                        )
+                    else:
+                        self._run_on_main_thread_sync(self.status_var.set, "验证码已通过，继续抓取...")
                     return True
             except Exception:
                 pass
@@ -801,12 +841,32 @@ class JianyuDesktopApp:
             self.progress_text_var.set(self.current_progress_base)
         elif stage == "search_page_loaded":
             self.current_progress_base = (
-                f"第一阶段: 第 {page}/{max_pages} 页已返回 | 本页原始 {page_items} 条 | 过滤后累计 {self.collected_records} 条 | {self.grouped_projects} 个项目"
+                f"第一阶段: 第 {page}/{max_pages} 页已返回 | 本页命中 {page_items} 条 | 累计 {self.collected_records} 条 | {self.grouped_projects} 个项目"
             )
             self.progress_text_var.set(self.current_progress_base)
         elif stage == "search_page_done":
             self.current_progress_base = (
                 f"第一阶段: 已搜 {page}/{max_pages} 页 | 已拿到 {self.collected_records} 条记录 | 已归并 {self.grouped_projects} 个项目"
+            )
+            self.progress_text_var.set(self.current_progress_base)
+        elif stage == "search_source_done":
+            self.current_progress_base = (
+                f"第一阶段: 当前频道已结束 | 已搜 {page}/{max_pages} 页 | 累计 {self.collected_records} 条 | {self.grouped_projects} 个项目 | {message or '-'}"
+            )
+            self.progress_text_var.set(self.current_progress_base)
+        elif stage == "search_done":
+            self.current_progress_base = (
+                f"第一阶段: 列表抓取完成 | 累计 {self.collected_records} 条 | {self.grouped_projects} 个项目 | 准备回补同项目文件"
+            )
+            self.progress_text_var.set(self.current_progress_base)
+        elif stage == "backfill_start":
+            self.current_progress_base = (
+                f"同项目回补: 待处理 {total} 个种子项目 | 当前已有 {self.grouped_projects} 个项目"
+            )
+            self.progress_text_var.set(self.current_progress_base)
+        elif stage == "backfill_done":
+            self.current_progress_base = (
+                f"同项目回补完成 | 补回 {page_items} 条记录 | 当前 {self.grouped_projects} 个项目"
             )
             self.progress_text_var.set(self.current_progress_base)
         elif stage == "detail_plan_ready":
@@ -837,20 +897,20 @@ class JianyuDesktopApp:
             self.status_var.set("验证码已通过，继续抓取...")
         elif stage == "rate_limit_wait":
             reason_text = "验证码冷却" if reason == "captcha_cooldown" else "请求间隔"
-            self.current_progress_base = f"等待中: {reason_text} {self._format_eta(seconds)} | 不是卡死"
-            self.progress_text_var.set(self.current_progress_base)
+            base = self.current_progress_base or "运行中"
+            self.progress_text_var.set(f"{base} | 等待中: {reason_text} {self._format_eta(seconds)} | 不是卡死")
         elif stage == "request_start":
             short_url = url[:92] + "..." if len(url) > 92 else url
-            self.current_progress_base = f"请求中: {short_url or '-'}"
-            self.progress_text_var.set(self.current_progress_base)
+            base = self.current_progress_base or "运行中"
+            self.progress_text_var.set(f"{base} | 请求中: {short_url or '-'}")
         elif stage == "request_done":
             short_url = url[:72] + "..." if len(url) > 72 else url
-            self.current_progress_base = f"请求完成: 用时 {self._format_eta(seconds)} | {short_url or '-'}"
-            self.progress_text_var.set(self.current_progress_base)
+            base = self.current_progress_base or "运行中"
+            self.progress_text_var.set(f"{base} | 请求完成: 用时 {self._format_eta(seconds)} | {short_url or '-'}")
         elif stage == "request_error":
             short_url = url[:72] + "..." if len(url) > 72 else url
-            self.current_progress_base = f"请求失败: {message or '-'} | {short_url or '-'}"
-            self.progress_text_var.set(self.current_progress_base)
+            base = self.current_progress_base or "运行中"
+            self.progress_text_var.set(f"{base} | 请求失败: {message or '-'} | {short_url or '-'}")
         elif stage == "detail_fetch_start":
             self.current_detail_title = short_title = title[:28] + "..." if len(title) > 28 else title
             self.current_detail_started_at = time.time()
@@ -1034,11 +1094,19 @@ class JianyuDesktopApp:
         lines.append(f"核心字段齐全项目数: {meta.get('core_analyzable_project_count', 0)}")
         lines.append(f"三文件完整项目数: {meta.get('file_complete_project_count', 0)}")
         lines.append(f"客户版JSON: {meta.get('customer_json_path') or '-'}")
-        lines.append("")
-        for source_name in ("jianyu", "ggzy"):
+        source_summary_parts: list[str] = []
+        for source_name, source_label in (("jianyu", "剑鱼"), ("ggzy", "全国公共资源")):
             source = sources.get(source_name) or {}
             source_meta = source.get("meta") or {}
-            lines.append(f"[源: {source_name}]")
+            source_summary_parts.append(
+                f"{source_label}: 项目{source_meta.get('project_count', 0)} / 核心{source_meta.get('core_analyzable_project_count', 0)} / 完整{source_meta.get('file_complete_project_count', 0)}"
+            )
+        lines.append(f"来源汇总: {' | '.join(source_summary_parts)}")
+        lines.append("")
+        for source_name, source_label in (("jianyu", "剑鱼"), ("ggzy", "全国公共资源")):
+            source = sources.get(source_name) or {}
+            source_meta = source.get("meta") or {}
+            lines.append(f"[源: {source_label}]")
             lines.append(f"项目数: {source_meta.get('project_count', 0)}")
             lines.append(f"核心字段齐全: {source_meta.get('core_analyzable_project_count', 0)}")
             lines.append(f"三文件完整: {source_meta.get('file_complete_project_count', 0)}")
@@ -1047,11 +1115,69 @@ class JianyuDesktopApp:
         self._set_summary("\n".join(lines).strip() or "暂无结果")
 
     def _derive_source_path(self, output_path: str, suffix: str, ext: str = ".json") -> str:
-        base = output_path or os.path.join(os.path.dirname(__file__), "bid_sources_output.json")
+        base = output_path or default_output_path()
         root, current_ext = os.path.splitext(base)
         if not current_ext:
             root = base
         return f"{root}_{suffix}{ext}"
+
+    def _derive_timestamped_path(self, output_path: str, run_id: str) -> str:
+        base = output_path or default_output_path()
+        root, ext = os.path.splitext(base)
+        if not ext:
+            root, ext = base, ".json"
+        return f"{root}_{run_id}{ext}"
+
+    @staticmethod
+    def _load_json_file(path: str) -> dict | None:
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _refresh_source_payload_counts(payload: dict | None) -> dict | None:
+        if not isinstance(payload, dict):
+            return payload
+        projects = [item for item in payload.get("projects") or [] if isinstance(item, dict)]
+        meta = dict(payload.get("meta") or {})
+        meta["project_count"] = len(projects)
+        meta["record_count"] = sum(len(project.get("records") or []) for project in projects)
+        meta["file_complete_project_count"] = sum(1 for project in projects if (project.get("summary") or {}).get("file_complete"))
+        meta["core_analyzable_project_count"] = sum(1 for project in projects if (project.get("summary") or {}).get("can_analyze_core"))
+        meta["usable_project_count"] = sum(1 for project in projects if (project.get("status") or {}).get("usable"))
+        payload["meta"] = meta
+        payload["projects"] = projects
+        return payload
+
+    def _merge_source_payload(self, existing: dict | None, current: dict | None) -> dict | None:
+        if not existing:
+            return self._refresh_source_payload_counts(current)
+        if not current:
+            return self._refresh_source_payload_counts(existing)
+        merged_projects: dict[str, dict] = {}
+        for project in list(existing.get("projects") or []) + list(current.get("projects") or []):
+            if not isinstance(project, dict):
+                continue
+            summary = project.get("summary") or {}
+            key = str(project.get("project_key") or summary.get("project_title") or "").strip()
+            if not key:
+                continue
+            merged_projects[key] = project
+        merged = dict(current)
+        merged["projects"] = list(merged_projects.values())
+        return self._refresh_source_payload_counts(merged)
+
+    @staticmethod
+    def _write_json_file(path: str, payload: dict | None) -> None:
+        if not path or payload is None:
+            return
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, indent=2)
 
     def _customer_project_from_any_source(self, project: dict, source_name: str) -> dict:
         summary = project.get("summary") or {}
@@ -1304,11 +1430,30 @@ class JianyuDesktopApp:
         }
         with open(customer_json_path, "w", encoding="utf-8") as fp:
             json.dump(customer_payload, fp, ensure_ascii=False, indent=2)
+        split_paths = write_customer_json_splits(customer_json_path, customer_payload)
+        output_payload["meta"]["customer_split_json_paths"] = split_paths
+        with open(output_path, "w", encoding="utf-8") as fp:
+            json.dump(output_payload, fp, ensure_ascii=False, indent=2)
         return output_payload
 
     @staticmethod
     def _is_expected_stop_exception(exc: Exception) -> bool:
         return str(exc) == "collection stopped"
+
+    @staticmethod
+    def _compact_jianyu_meta(payload: dict | None) -> dict:
+        meta = (payload or {}).get("meta") or {}
+        issue_counts = ((meta.get("audit") or {}).get("issue_counts") or {}) if isinstance(meta.get("audit"), dict) else {}
+        return {
+            "source_mode": meta.get("source_mode"),
+            "record_count": meta.get("record_count"),
+            "project_count": meta.get("project_count"),
+            "core_analyzable_project_count": meta.get("core_analyzable_project_count"),
+            "file_complete_project_count": meta.get("file_complete_project_count"),
+            "anti_verify": meta.get("anti_verify"),
+            "issue_counts": issue_counts,
+            "customer_json_path": meta.get("customer_json_path"),
+        }
 
     def run_capture(self) -> None:
         if self.collection_running:
@@ -1327,7 +1472,7 @@ class JianyuDesktopApp:
         province = self.province_var.get().strip() or "西藏"
         keep_browser_session = self.keep_browser_session_var.get()
         cookie_path = self.cookie_var.get().strip()
-        output = self.output_var.get().strip()
+        database_output = self.output_var.get().strip()
         if not cookie_path or not os.path.exists(cookie_path):
             messagebox.showwarning("提示", "请选择有效的剑鱼 Cookie 文件。全国公共资源不需要 Cookie，但剑鱼需要。")
             return
@@ -1335,6 +1480,10 @@ class JianyuDesktopApp:
             self._refresh_cookie_from_browser_if_possible()
         except Exception as exc:
             messagebox.showwarning("提示", f"无法从当前浏览器会话刷新剑鱼登录态，将继续使用现有 Cookie 文件。\n原因：{exc}")
+        run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output = self._derive_timestamped_path(database_output, run_id)
+        jianyu_database = self._derive_source_path(database_output, "jianyu")
+        ggzy_database = self._derive_source_path(database_output, "ggzy")
         jianyu_output = self._derive_source_path(output, "jianyu")
         ggzy_output = self._derive_source_path(output, "ggzy")
         run_mode = "双源抓取：剑鱼使用登录态，全国公共资源使用公开接口"
@@ -1348,7 +1497,11 @@ class JianyuDesktopApp:
                 "province": province,
                 "recent_days": recent_days,
                 "cookie_path": cookie_path,
+                "database_output": database_output,
                 "output": output,
+                "run_id": run_id,
+                "jianyu_database": jianyu_database,
+                "ggzy_database": ggzy_database,
                 "jianyu_output": jianyu_output,
                 "ggzy_output": ggzy_output,
                 "keep_browser_session": keep_browser_session,
@@ -1357,7 +1510,7 @@ class JianyuDesktopApp:
             },
         )
         self._append_log(f"[模式] {run_mode}\n")
-        self._append_log(f"[输出] 合并={output} | 剑鱼={jianyu_output} | 全国公共资源={ggzy_output}\n")
+        self._append_log(f"[输出] 本次合并={output} | 数据库={database_output} | 剑鱼库={jianyu_database} | 全国库={ggzy_database}\n")
         self.run_started_at = time.time()
         self.progress_total = 0
         self.progress_current = 0
@@ -1399,6 +1552,7 @@ class JianyuDesktopApp:
                     fetch_details=True,
                     detail_limit=120,
                     source_mode="area_listing",
+                    cache_json=jianyu_database,
                 )
                 try:
                     previous_provider = collector.COOKIE_PROVIDER
@@ -1423,7 +1577,7 @@ class JianyuDesktopApp:
                         collector.BROWSER_REQUEST_PROVIDER = previous_browser_provider
                         collector.BROWSER_RENDERED_PROVIDER = previous_rendered_provider
                         collector.MANUAL_CAPTCHA_HANDLER = previous_manual_captcha
-                    self._run_on_main_thread_sync(self._append_log, "[剑鱼完成] " + json.dumps((jianyu_payload or {}).get("meta") or {}, ensure_ascii=False) + "\n")
+                    self._run_on_main_thread_sync(self._append_log, "[剑鱼完成] " + json.dumps(self._compact_jianyu_meta(jianyu_payload), ensure_ascii=False) + "\n")
                 except Exception as exc:
                     jianyu_error = "" if self._is_expected_stop_exception(exc) else str(exc)
                     if os.path.exists(jianyu_output):
@@ -1443,6 +1597,19 @@ class JianyuDesktopApp:
                         self._run_on_main_thread_sync(self._append_log, f"[剑鱼失败] {jianyu_error}\n{traceback.format_exc()}\n")
                     else:
                         self._run_on_main_thread_sync(self._append_log, "[剑鱼停止] 已收到停止请求，已保留当前结果。\n")
+                jianyu_payload = self._merge_source_payload(self._load_json_file(jianyu_database), jianyu_payload)
+                if jianyu_payload:
+                    self._write_json_file(jianyu_output, jianyu_payload)
+                    self._write_json_file(jianyu_database, jianyu_payload)
+                    try:
+                        run_customer_path = collector.write_customer_json(jianyu_output, jianyu_payload)
+                        stable_customer_path = collector.write_customer_json(jianyu_database, jianyu_payload)
+                        (jianyu_payload.setdefault("meta", {}))["customer_json_path"] = run_customer_path
+                        self._write_json_file(jianyu_output, jianyu_payload)
+                        (jianyu_payload.setdefault("meta", {}))["customer_json_path"] = stable_customer_path
+                        self._write_json_file(jianyu_database, jianyu_payload)
+                    except Exception:
+                        pass
                 if self.stop_flag:
                     self._write_multi_source_output(
                         output,
@@ -1455,6 +1622,18 @@ class JianyuDesktopApp:
                         ggzy_error=ggzy_error,
                         jianyu_output=jianyu_output,
                         ggzy_output=ggzy_output,
+                    )
+                    self._write_multi_source_output(
+                        database_output,
+                        keywords=keywords,
+                        province=province,
+                        recent_days=recent_days,
+                        jianyu_payload=jianyu_payload,
+                        ggzy_payload=ggzy_payload,
+                        jianyu_error=jianyu_error,
+                        ggzy_error=ggzy_error,
+                        jianyu_output=jianyu_database,
+                        ggzy_output=ggzy_database,
                     )
                     self._enqueue_ui(self._render_summary_from_output, output)
                     self._enqueue_ui(self._finish, "已停止，已保存当前结果")
@@ -1502,6 +1681,19 @@ class JianyuDesktopApp:
                     ggzy_collector.PROGRESS_CALLBACK = previous_callback
                     ggzy_collector.STOP_REQUESTED = previous_stop
                     ggzy_collector.CAPTCHA_HANDLER = previous_captcha
+                ggzy_payload = self._merge_source_payload(self._load_json_file(ggzy_database), ggzy_payload)
+                if ggzy_payload:
+                    self._write_json_file(ggzy_output, ggzy_payload)
+                    self._write_json_file(ggzy_database, ggzy_payload)
+                    try:
+                        run_customer_path = ggzy_collector.write_customer_json(ggzy_output, ggzy_payload)
+                        stable_customer_path = ggzy_collector.write_customer_json(ggzy_database, ggzy_payload)
+                        (ggzy_payload.setdefault("meta", {}))["customer_json_path"] = run_customer_path
+                        self._write_json_file(ggzy_output, ggzy_payload)
+                        (ggzy_payload.setdefault("meta", {}))["customer_json_path"] = stable_customer_path
+                        self._write_json_file(ggzy_database, ggzy_payload)
+                    except Exception:
+                        pass
 
                 if self.stop_flag:
                     self._write_multi_source_output(
@@ -1515,6 +1707,18 @@ class JianyuDesktopApp:
                         ggzy_error=ggzy_error,
                         jianyu_output=jianyu_output,
                         ggzy_output=ggzy_output,
+                    )
+                    self._write_multi_source_output(
+                        database_output,
+                        keywords=keywords,
+                        province=province,
+                        recent_days=recent_days,
+                        jianyu_payload=jianyu_payload,
+                        ggzy_payload=ggzy_payload,
+                        jianyu_error=jianyu_error,
+                        ggzy_error=ggzy_error,
+                        jianyu_output=jianyu_database,
+                        ggzy_output=ggzy_database,
                     )
                     self._enqueue_ui(self._render_summary_from_output, output)
                     self._enqueue_ui(self._finish, "已停止，已保存当前结果")
@@ -1530,6 +1734,18 @@ class JianyuDesktopApp:
                     ggzy_error=ggzy_error,
                     jianyu_output=jianyu_output,
                     ggzy_output=ggzy_output,
+                )
+                self._write_multi_source_output(
+                    database_output,
+                    keywords=keywords,
+                    province=province,
+                    recent_days=recent_days,
+                    jianyu_payload=jianyu_payload,
+                    ggzy_payload=ggzy_payload,
+                    jianyu_error=jianyu_error,
+                    ggzy_error=ggzy_error,
+                    jianyu_output=jianyu_database,
+                    ggzy_output=ggzy_database,
                 )
                 self._enqueue_ui(self._render_summary_from_output, output)
                 if jianyu_error and ggzy_error:
@@ -1571,6 +1787,8 @@ class JianyuDesktopApp:
                 "current_progress_base": self.current_progress_base,
             },
         )
+        if self.shutting_down:
+            return
         self.progress["value"] = 100 if status == "完成" else self.progress["value"]
         self.run_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
@@ -1601,7 +1819,10 @@ class JianyuDesktopApp:
         self.playwright = None
 
     def _on_close(self) -> None:
+        self.shutting_down = True
         self.stop_flag = True
+        collector.STOP_REQUESTED = lambda: True
+        ggzy_collector.STOP_REQUESTED = lambda: True
         self._close_login_browser()
         self.root.destroy()
 

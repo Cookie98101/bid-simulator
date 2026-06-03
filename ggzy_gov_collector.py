@@ -25,6 +25,7 @@ from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
+from customer_json_utils import write_customer_json_splits
 
 
 BASE_URL = "https://www.ggzy.gov.cn"
@@ -1316,7 +1317,9 @@ def build_analysis(projects: list[dict[str, Any]]) -> dict[str, Any]:
 
 def write_customer_json(output_path: str, output: dict[str, Any]) -> str:
     target_path = derive_customer_json_path(output_path)
-    write_json(target_path, build_customer_json(output))
+    customer_payload = build_customer_json(output)
+    write_json(target_path, customer_payload)
+    write_customer_json_splits(target_path, customer_payload)
     return target_path
 
 

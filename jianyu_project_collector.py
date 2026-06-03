@@ -41,6 +41,7 @@ from playwright.sync_api import sync_playwright
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.asymmetric import padding
+from customer_json_utils import write_customer_json_splits
 
 
 SEARCH_URL = "https://www.jianyu360.cn/jyapi/jybx/core/fType/searchList"
@@ -829,6 +830,7 @@ class SearchConfig:
     detail_verify_backfill_limit: int = 120
     search_backfill_mode: str = "auto"
     precise_project_query: str = ""
+    cache_json: str = ""
 
 
 LAST_FETCH_META: dict[str, Any] = {
@@ -919,6 +921,10 @@ def abort_if_requested() -> None:
             raise
         except Exception:
             pass
+
+
+def is_collection_stopped_exception(exc: Exception) -> bool:
+    return isinstance(exc, RuntimeError) and str(exc) == "collection stopped"
 
 
 DETAIL_FETCH_STATE: dict[str, Any] = {
@@ -3061,7 +3067,9 @@ def enrich_record_with_detail(record: dict[str, Any], cookie: str) -> dict[str, 
         return record
     try:
         html_text = fetch_html(url, cookie)
-    except Exception:
+    except Exception as exc:
+        if is_collection_stopped_exception(exc):
+            raise
         return record
     if is_captcha_html(html_text):
         register_detail_captcha_hit()
@@ -3080,7 +3088,9 @@ def enrich_record_with_detail(record: dict[str, Any], cookie: str) -> dict[str, 
         if resumed:
             try:
                 html_text = fetch_html(url, cookie)
-            except Exception:
+            except Exception as exc:
+                if is_collection_stopped_exception(exc):
+                    raise
                 return record
             if is_captcha_html(html_text):
                 return record
@@ -3089,13 +3099,17 @@ def enrich_record_with_detail(record: dict[str, Any], cookie: str) -> dict[str, 
     if sid:
         try:
             preagent = fetch_detail_preagent(url, cookie)
-        except Exception:
+        except Exception as exc:
+            if is_collection_stopped_exception(exc):
+                raise
             preagent = {}
         token = str(((preagent.get("data") or {}).get("token")) or "")
         if token:
             try:
                 baseinfo = fetch_detail_baseinfo(url, sid, token, cookie)
-            except Exception:
+            except Exception as exc:
+                if is_collection_stopped_exception(exc):
+                    raise
                 baseinfo = {}
             detail_html = str((((baseinfo.get("data") or {}).get("detailInfo") or {}).get("detail")) or "")
             if detail_html:
@@ -3120,7 +3134,9 @@ def enrich_record_with_detail(record: dict[str, Any], cookie: str) -> dict[str, 
     ):
         try:
             rendered_payload = fetch_rendered_open_record_payload(url, cookie)
-        except Exception:
+        except Exception as exc:
+            if is_collection_stopped_exception(exc):
+                raise
             rendered_payload = {}
         rendered_text = str(rendered_payload.get("text") or "")
         rendered_tables = list(rendered_payload.get("tables") or [])
@@ -3140,7 +3156,9 @@ def enrich_record_with_detail(record: dict[str, Any], cookie: str) -> dict[str, 
             if resumed:
                 try:
                     rendered_payload = fetch_rendered_open_record_payload(url, cookie)
-                except Exception:
+                except Exception as exc:
+                    if is_collection_stopped_exception(exc):
+                        raise
                     return record
                 rendered_text = str(rendered_payload.get("text") or "")
                 rendered_tables = list(rendered_payload.get("tables") or [])
@@ -3549,8 +3567,91 @@ def load_records_from_project_json(path: str) -> list[dict[str, Any]]:
                 continue
             if url:
                 seen_urls.add(url)
+            record = dict(record)
+            mark_cache_record(record)
             records.append(record)
     return records
+
+
+def load_cache_records(path: str) -> list[dict[str, Any]]:
+    if not path:
+        return []
+    cache_path = Path(path)
+    if not cache_path.exists():
+        return []
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    records: list[dict[str, Any]] = []
+    if isinstance(payload, dict) and payload.get("projects"):
+        for project in payload.get("projects") or []:
+            if not isinstance(project, dict):
+                continue
+            for record in project.get("records") or []:
+                if isinstance(record, dict):
+                    record = dict(record)
+                    mark_cache_record(record)
+                    records.append(record)
+    elif isinstance(payload, dict):
+        source_payload = (((payload.get("sources") or {}).get("jianyu") or {}).get("payload") or {})
+        if isinstance(source_payload, dict) and source_payload.get("projects"):
+            for project in source_payload.get("projects") or []:
+                if not isinstance(project, dict):
+                    continue
+                for record in project.get("records") or []:
+                    if isinstance(record, dict):
+                        record = dict(record)
+                        mark_cache_record(record)
+                        records.append(record)
+    if not records:
+        return []
+    normalized = normalize_records_after_detail(records)
+    for record in normalized:
+        ensure_cache_detail_state(record)
+    return normalized
+
+
+def is_cache_record(record: dict[str, Any]) -> bool:
+    return bool(record.get("_cache_record"))
+
+
+DETAIL_FETCH_STATE_KEY = "_detail_fetch_state"
+DETAIL_FETCH_REASON_KEY = "_detail_fetch_reason"
+
+
+def set_detail_fetch_state(record: dict[str, Any], state: str, reason: str = "") -> dict[str, Any]:
+    record[DETAIL_FETCH_STATE_KEY] = state
+    if reason:
+        record[DETAIL_FETCH_REASON_KEY] = reason
+    return record
+
+
+def mark_cache_record(record: dict[str, Any]) -> dict[str, Any]:
+    record["_cache_record"] = True
+    if not record.get(DETAIL_FETCH_STATE_KEY):
+        # Existing database files were created before checkpoints existed.
+        # Treat them as checked so old known-missing records do not rerun.
+        set_detail_fetch_state(record, "legacy_checked", "loaded_before_checkpoint")
+    return record
+
+
+def ensure_cache_detail_state(record: dict[str, Any]) -> dict[str, Any]:
+    if record.get(DETAIL_FETCH_STATE_KEY):
+        return record
+    if record_has_detail_payload(record) or not record_needs_backfill(record):
+        return set_detail_fetch_state(record, "checked", "legacy_has_detail_or_core_fields")
+    return set_detail_fetch_state(record, "legacy_checked", "legacy_existing_record")
+
+
+def should_skip_cached_detail(record: dict[str, Any]) -> bool:
+    if not is_cache_record(record):
+        return False
+    return str(record.get(DETAIL_FETCH_STATE_KEY) or "") != "pending"
+
+
+def mark_records_pending(records: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
+    return [set_detail_fetch_state(record, "pending", reason) if isinstance(record, dict) else record for record in records]
 
 
 OUTPUT_LIKE_NAME_TOKENS = (
@@ -4067,6 +4168,14 @@ def load_records_from_area_listing(cookie: str, config: SearchConfig) -> list[di
                 grouped_projects=len(records) + len(page_records),
             )
             if not page_records:
+                emit_progress(
+                    "search_source_done",
+                    page=page_index,
+                    max_pages=total_pages,
+                    collected_records=len(records),
+                    grouped_projects=len(records),
+                    message="本频道当前页无命中记录，切换下一个频道或进入下一阶段",
+                )
                 break
             stop_due_to_date = False
             for record in page_records:
@@ -4104,7 +4213,21 @@ def load_records_from_area_listing(cookie: str, config: SearchConfig) -> list[di
                 grouped_projects=len(records),
             )
             if stop_due_to_date:
+                emit_progress(
+                    "search_source_done",
+                    page=page_index,
+                    max_pages=total_pages,
+                    collected_records=len(records),
+                    grouped_projects=len(records),
+                    message="已到时间范围外，切换下一个频道或进入下一阶段",
+                )
                 break
+    emit_progress(
+        "search_done",
+        max_pages=total_pages,
+        collected_records=len(records),
+        grouped_projects=len(records),
+    )
     global LAST_FETCH_META
     LAST_FETCH_META["anti_verify"] = False
     LAST_FETCH_META["anti_verify_text"] = None
@@ -5961,7 +6084,9 @@ def write_json(path: str, payload: Any) -> None:
 
 def write_customer_json(output_path: str, output: dict[str, Any], customer_json_path: str = "") -> str:
     target_path = customer_json_path or derive_customer_json_path(output_path)
-    write_json(target_path, build_customer_json(output))
+    customer_payload = build_customer_json(output)
+    write_json(target_path, customer_payload)
+    write_customer_json_splits(target_path, customer_payload)
     return target_path
 
 
@@ -6181,6 +6306,7 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
         "anti_verify": False,
         "anti_verify_text": None,
     }
+    cache_records = load_cache_records(config.cache_json)
     try:
         if config.input_urls_json:
             source_mode = "input_urls_json"
@@ -6207,32 +6333,61 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                 source_mode = "area_listing"
                 discovery_config = dataclasses.replace(config, industry="", fetch_details=False)
                 records = load_records_from_area_listing(cookie, discovery_config)
+                if cache_records:
+                    records = merge_records_by_url(cache_records, records)
                 if config.fetch_details:
                     seed_records = [
                         item for item in records
-                        if is_target_construction_record(item)
+                        if is_target_construction_record(item) and not is_cache_record(item)
                     ]
+                    emit_progress(
+                        "backfill_start",
+                        total=len(seed_records),
+                        grouped_projects=len(seed_records),
+                    )
                     candidate_records = backfill_project_records(cookie, dataclasses.replace(config, industry=""), seed_records)
+                    emit_progress(
+                        "backfill_done",
+                        page_items=max(0, len(candidate_records) - len(seed_records)),
+                        grouped_projects=len(candidate_records),
+                    )
                     candidate_records = merge_records_by_url(seed_records, candidate_records)
+                    if cache_records:
+                        candidate_records = merge_records_by_url(cache_records, candidate_records)
                     records = []
                     detail_count = 0
-                    for record in sorted(candidate_records, key=detail_fetch_priority):
-                        if not record_needs_backfill(record):
+                    sorted_candidate_records = sorted(candidate_records, key=detail_fetch_priority)
+                    for idx, record in enumerate(sorted_candidate_records):
+                        if STOP_REQUESTED is not None and STOP_REQUESTED():
+                            records.extend(mark_records_pending(sorted_candidate_records[idx:], "stopped_before_detail_fetch"))
+                            break
+                        if should_skip_cached_detail(record):
                             records.append(record)
+                            continue
+                        if not record_needs_backfill(record):
+                            records.append(set_detail_fetch_state(record, "checked", "core_fields_present"))
                             continue
                         if config.detail_limit > 0 and detail_count >= config.detail_limit:
-                            records.append(record)
+                            records.append(set_detail_fetch_state(record, "pending", "detail_limit_reached"))
                             continue
                         try:
-                            records.append(reparse_record_from_detail(enrich_record_with_detail(record, cookie)))
+                            records.append(set_detail_fetch_state(reparse_record_from_detail(enrich_record_with_detail(record, cookie)), "checked", "detail_fetch_attempted"))
                         except ManualCaptchaRequired:
-                            records.append(record)
+                            records.append(set_detail_fetch_state(record, "pending", "manual_captcha_required"))
+                        except Exception as exc:
+                            if is_collection_stopped_exception(exc):
+                                records.append(set_detail_fetch_state(record, "pending", "stopped_during_detail_fetch"))
+                                records.extend(mark_records_pending(sorted_candidate_records[idx + 1:], "stopped_before_detail_fetch"))
+                                break
+                            raise
                         detail_count += 1
             else:
                 cookie = load_cookie(config)
                 source_mode = "searchList"
                 try:
                     records = load_records(cookie, dataclasses.replace(config, industry="", fetch_details=False))
+                    if cache_records:
+                        records = merge_records_by_url(cache_records, records)
                 except SystemExit as exc:
                     if (
                         "antiVerify captcha" not in str(exc)
@@ -6244,23 +6399,51 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                     cookie = load_cookie(config, required=False)
                     discovery_config = dataclasses.replace(config, industry="", fetch_details=False)
                     records = load_records_from_area_listing(cookie, discovery_config)
+                    if cache_records:
+                        records = merge_records_by_url(cache_records, records)
                     if config.fetch_details:
                         seed_records = [
                             item for item in records
-                            if is_target_construction_record(item)
+                            if is_target_construction_record(item) and not is_cache_record(item)
                         ]
+                        emit_progress(
+                            "backfill_start",
+                            total=len(seed_records),
+                            grouped_projects=len(seed_records),
+                        )
                         candidate_records = backfill_project_records(cookie, dataclasses.replace(config, industry=""), seed_records)
+                        emit_progress(
+                            "backfill_done",
+                            page_items=max(0, len(candidate_records) - len(seed_records)),
+                            grouped_projects=len(candidate_records),
+                        )
                         candidate_records = merge_records_by_url(seed_records, candidate_records)
+                        if cache_records:
+                            candidate_records = merge_records_by_url(cache_records, candidate_records)
                         records = []
                         detail_count = 0
-                        for record in sorted(candidate_records, key=detail_fetch_priority):
-                            if not record_needs_backfill(record):
+                        sorted_candidate_records = sorted(candidate_records, key=detail_fetch_priority)
+                        for idx, record in enumerate(sorted_candidate_records):
+                            if STOP_REQUESTED is not None and STOP_REQUESTED():
+                                records.extend(mark_records_pending(sorted_candidate_records[idx:], "stopped_before_detail_fetch"))
+                                break
+                            if should_skip_cached_detail(record):
                                 records.append(record)
+                                continue
+                            if not record_needs_backfill(record):
+                                records.append(set_detail_fetch_state(record, "checked", "core_fields_present"))
                                 continue
                             if config.detail_limit > 0 and detail_count >= config.detail_limit:
-                                records.append(record)
+                                records.append(set_detail_fetch_state(record, "pending", "detail_limit_reached"))
                                 continue
-                            records.append(reparse_record_from_detail(enrich_record_with_detail(record, cookie)))
+                            try:
+                                records.append(set_detail_fetch_state(reparse_record_from_detail(enrich_record_with_detail(record, cookie)), "checked", "detail_fetch_attempted"))
+                            except Exception as exc:
+                                if is_collection_stopped_exception(exc):
+                                    records.append(set_detail_fetch_state(record, "pending", "stopped_during_detail_fetch"))
+                                    records.extend(mark_records_pending(sorted_candidate_records[idx + 1:], "stopped_before_detail_fetch"))
+                                    break
+                                raise
                             detail_count += 1
     except SystemExit as exc:
         if "antiVerify captcha" not in str(exc):
@@ -6279,6 +6462,7 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                 "project_count": 0,
                 "usable_project_count": 0,
                 "core_analyzable_project_count": 0,
+                "cache_record_count": len(cache_records),
                 "source_mode": anti_verify_meta.get("source_mode"),
                 "anti_verify": anti_verify_meta.get("anti_verify"),
                 "anti_verify_text": anti_verify_meta.get("anti_verify_text"),
@@ -6320,7 +6504,7 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
         if should_backfill_seed_records:
             seed_records = [
                 item for item in records
-                if is_target_construction_record(item)
+                if is_target_construction_record(item) and not should_skip_cached_detail(item)
             ]
             candidate_records = backfill_project_records(cookie, dataclasses.replace(config, industry=""), seed_records)
             records = merge_records_by_url(records, candidate_records)
@@ -6332,6 +6516,8 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
         eligible_detail_records = 0
         for record in records:
             abort_if_requested()
+            if should_skip_cached_detail(record):
+                continue
             project_key = build_record_group_key(record)
             project_summary = pre_summaries.get(project_key)
             if not record_needs_backfill(record):
@@ -6353,20 +6539,26 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
         )
         detail_count = 0
         hydrated_records: list[dict[str, Any]] = []
-        for record in records:
+        for idx, record in enumerate(records):
+            if STOP_REQUESTED is not None and STOP_REQUESTED():
+                hydrated_records.extend(mark_records_pending(records[idx:], "stopped_before_detail_fetch"))
+                break
+            if should_skip_cached_detail(record):
+                hydrated_records.append(record)
+                continue
             project_key = build_record_group_key(record)
             project_summary = pre_summaries.get(project_key)
             if not record_needs_backfill(record):
-                hydrated_records.append(record)
+                hydrated_records.append(set_detail_fetch_state(record, "checked", "core_fields_present"))
                 continue
             if record_has_detail_payload(record):
-                hydrated_records.append(reparse_record_from_detail(record))
+                hydrated_records.append(set_detail_fetch_state(reparse_record_from_detail(record), "checked", "detail_payload_present"))
                 continue
             if not should_fetch_detail_for_batch(record, project_summary):
-                hydrated_records.append(record)
+                hydrated_records.append(set_detail_fetch_state(record, "checked", "not_eligible_for_detail_fetch"))
                 continue
             if config.detail_limit > 0 and detail_count >= config.detail_limit:
-                hydrated_records.append(record)
+                hydrated_records.append(set_detail_fetch_state(record, "pending", "detail_limit_reached"))
                 continue
             emit_progress(
                 "detail_fetch_start",
@@ -6375,9 +6567,15 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                 title=str(record.get("title") or record.get("project_name") or ""),
             )
             try:
-                hydrated_records.append(reparse_record_from_detail(enrich_record_with_detail(record, cookie)))
+                hydrated_records.append(set_detail_fetch_state(reparse_record_from_detail(enrich_record_with_detail(record, cookie)), "checked", "detail_fetch_attempted"))
             except ManualCaptchaRequired:
-                hydrated_records.append(record)
+                hydrated_records.append(set_detail_fetch_state(record, "pending", "manual_captcha_required"))
+            except Exception as exc:
+                if is_collection_stopped_exception(exc):
+                    hydrated_records.append(set_detail_fetch_state(record, "pending", "stopped_during_detail_fetch"))
+                    hydrated_records.extend(mark_records_pending(records[idx + 1:], "stopped_before_detail_fetch"))
+                    break
+                raise
             detail_count += 1
             current_core_count = count_core_projects(hydrated_records + records[len(hydrated_records):], config.allow_core_without_notice)
             emit_progress(
@@ -6394,19 +6592,24 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
             hydrated_followups: list[dict[str, Any]] = []
             kept_followups = 0
             filtered_followups = 0
-            for record in records:
-                abort_if_requested()
+            for idx, record in enumerate(records):
+                if STOP_REQUESTED is not None and STOP_REQUESTED():
+                    hydrated_followups.extend(mark_records_pending(records[idx:], "stopped_before_followup_detail_fetch"))
+                    break
+                if should_skip_cached_detail(record):
+                    hydrated_followups.append(record)
+                    continue
                 if record_has_detail_payload(record):
                     if not followup_record_matches_origin(record):
                         filtered_followups += 1
                         continue
                     if (record.get("raw") or {}).get("source") in {"original_url", "related_link"}:
                         kept_followups += 1
-                    hydrated_followups.append(record)
+                    hydrated_followups.append(set_detail_fetch_state(record, "checked", "followup_detail_payload_present"))
                     continue
                 if config.detail_limit > 0 and detail_count >= config.detail_limit:
                     if not is_followup_shell_record(record):
-                        hydrated_followups.append(record)
+                        hydrated_followups.append(set_detail_fetch_state(record, "pending", "detail_limit_reached"))
                     continue
                 emit_progress(
                     "detail_fetch_start",
@@ -6417,8 +6620,14 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                 try:
                     enriched = reparse_record_from_detail(enrich_record_with_detail(record, cookie))
                 except ManualCaptchaRequired:
-                    hydrated_followups.append(record)
+                    hydrated_followups.append(set_detail_fetch_state(record, "pending", "manual_captcha_required"))
                     continue
+                except Exception as exc:
+                    if is_collection_stopped_exception(exc):
+                        hydrated_followups.append(set_detail_fetch_state(record, "pending", "stopped_during_followup_detail_fetch"))
+                        hydrated_followups.extend(mark_records_pending(records[idx + 1:], "stopped_before_followup_detail_fetch"))
+                        break
+                    raise
                 if is_followup_shell_record(enriched):
                     filtered_followups += 1
                     continue
@@ -6427,7 +6636,7 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
                     continue
                 if ((enriched.get("raw") or {}).get("source")) in {"original_url", "related_link"}:
                     kept_followups += 1
-                hydrated_followups.append(enriched)
+                hydrated_followups.append(set_detail_fetch_state(enriched, "checked", "followup_detail_fetch_attempted"))
                 detail_count += 1
                 current_core_count = count_core_projects(hydrated_followups, config.allow_core_without_notice)
                 emit_progress(
@@ -6473,6 +6682,7 @@ def run_collection(config: SearchConfig) -> dict[str, Any]:
             "usable_project_count": sum(1 for item in projects if item["status"]["usable"]),
             "file_complete_project_count": sum(1 for item in projects if item["summary"]["file_complete"]),
             "core_analyzable_project_count": sum(1 for item in projects if item["summary"]["can_analyze_core"]),
+            "cache_record_count": len(cache_records),
             "source_mode": source_mode or LAST_FETCH_META.get("source_mode"),
             "anti_verify": LAST_FETCH_META.get("anti_verify"),
             "anti_verify_text": LAST_FETCH_META.get("anti_verify_text"),
