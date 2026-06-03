@@ -759,13 +759,17 @@ class JianyuDesktopApp:
         raise value
 
     def _drain_ui_tasks(self) -> None:
+        processed = 0
         try:
             while True:
+                if processed >= 80:
+                    break
                 callback, args = self.ui_task_queue.get_nowait()
                 try:
                     callback(*args)
                 except Exception:
                     pass
+                processed += 1
         except queue.Empty:
             pass
         if self.root.winfo_exists():
@@ -935,12 +939,19 @@ class JianyuDesktopApp:
             return
         now = time.time()
         text = self.current_progress_base or "运行中"
-        if self.current_detail_started_at > 0:
+        stale_seconds = (now - self.last_progress_at) if self.last_progress_at else 0.0
+        auto_stopping = stale_seconds >= 480 and not self.captcha_waiting and not self.stop_flag
+        if auto_stopping:
+            self.stop_flag = True
+            self.status_var.set("长时间无进展，已自动停止并保存当前结果...")
+        if auto_stopping:
+            text = f"{text} | 超过 {self._format_eta(stale_seconds)} 无新进度，自动停止并保存"
+        elif self.current_detail_started_at > 0:
             current_elapsed = self._format_eta(now - self.current_detail_started_at)
-            stale_elapsed = self._format_eta(now - self.last_progress_at) if self.last_progress_at else "0秒"
+            stale_elapsed = self._format_eta(stale_seconds) if self.last_progress_at else "0秒"
             text = f"{text} | 当前条已耗时 {current_elapsed} | 距上次进度 {stale_elapsed}"
         elif self.last_progress_at > 0:
-            stale_elapsed = self._format_eta(now - self.last_progress_at)
+            stale_elapsed = self._format_eta(stale_seconds)
             text = f"{text} | 距上次进度 {stale_elapsed}"
         self.progress_text_var.set(text)
         self.root.after(1000, self._tick_runtime_feedback)
@@ -970,21 +981,23 @@ class JianyuDesktopApp:
     def _handle_progress_payload(self, payload: dict) -> None:
         self.last_progress_site = str(payload.get("site") or "")
         self._write_run_log("__PROGRESS__" + json.dumps(payload, ensure_ascii=False) + "\n")
-        self.root.after(0, self._update_progress_ui,
-                        str(payload.get("stage") or ""),
-                        int(payload.get("current") or 0),
-                        int(payload.get("total") or payload.get("detail_plan_total") or 0),
-                        str(payload.get("title") or ""),
-                        int(payload.get("page") or 0),
-                        int(payload.get("max_pages") or 0),
-                        int(payload.get("page_items") or 0),
-                        int(payload.get("collected_records") or 0),
-                        int(payload.get("grouped_projects") or 0),
-                        int(payload.get("core_projects") or 0),
-                        str(payload.get("message") or payload.get("error") or ""),
-                        str(payload.get("url") or ""),
-                        float(payload.get("seconds") or payload.get("elapsed_seconds") or 0.0),
-                        str(payload.get("reason") or ""))
+        self._enqueue_ui(
+            self._update_progress_ui,
+            str(payload.get("stage") or ""),
+            int(payload.get("current") or 0),
+            int(payload.get("total") or payload.get("detail_plan_total") or 0),
+            str(payload.get("title") or ""),
+            int(payload.get("page") or 0),
+            int(payload.get("max_pages") or 0),
+            int(payload.get("page_items") or 0),
+            int(payload.get("collected_records") or 0),
+            int(payload.get("grouped_projects") or 0),
+            int(payload.get("core_projects") or 0),
+            str(payload.get("message") or payload.get("error") or ""),
+            str(payload.get("url") or ""),
+            float(payload.get("seconds") or payload.get("elapsed_seconds") or 0.0),
+            str(payload.get("reason") or ""),
+        )
 
     def _set_summary(self, text: str) -> None:
         self.summary.configure(state="normal")
