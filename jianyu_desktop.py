@@ -41,8 +41,9 @@ APP_STATE_DIR = app_state_dir()
 LOGIN_PROFILE_DIR = os.path.join(APP_STATE_DIR, "login_profile")
 DEFAULT_COOKIE_PATH = os.path.join(APP_STATE_DIR, "jianyu_cookie.txt")
 DIAGNOSTICS_DIR = os.path.join(APP_STATE_DIR, "diagnostics")
-DIAGNOSTIC_RETENTION_DAYS = 14
-DIAGNOSTIC_RETENTION_RUNS = 30
+DIAGNOSTIC_RETENTION_DAYS = 7
+DIAGNOSTIC_RETENTION_RUNS = 10
+DIAGNOSTIC_RETENTION_MAX_BYTES = 300 * 1024 * 1024
 
 
 def playwright_channel_candidates() -> list[str | None]:
@@ -705,20 +706,21 @@ class JianyuDesktopApp:
 
     def _cleanup_old_diagnostics(self) -> dict:
         if not os.path.isdir(DIAGNOSTICS_DIR):
-            return {"deleted": 0, "kept": 0, "errors": []}
+            return {"deleted": 0, "kept": 0, "total_bytes": 0, "errors": []}
         now = time.time()
         max_age_seconds = DIAGNOSTIC_RETENTION_DAYS * 24 * 60 * 60
-        entries: list[tuple[float, str]] = []
+        entries: list[tuple[float, str, int]] = []
         for name in os.listdir(DIAGNOSTICS_DIR):
             path = os.path.join(DIAGNOSTICS_DIR, name)
             if not os.path.isdir(path):
                 continue
             try:
-                entries.append((os.path.getmtime(path), path))
+                entries.append((os.path.getmtime(path), path, self._directory_size(path)))
             except OSError:
                 continue
         entries.sort(reverse=True)
         deleted = 0
+        deleted_paths: set[str] = set()
         errors: list[str] = []
         for index, (mtime, path) in enumerate(entries):
             should_delete = index >= DIAGNOSTIC_RETENTION_RUNS or (now - mtime) > max_age_seconds
@@ -727,9 +729,42 @@ class JianyuDesktopApp:
             try:
                 shutil.rmtree(path)
                 deleted += 1
+                deleted_paths.add(path)
             except Exception as exc:
                 errors.append(f"{path}: {exc}")
-        return {"deleted": deleted, "kept": max(0, len(entries) - deleted), "errors": errors}
+        remaining = [(mtime, path, size) for mtime, path, size in entries if path not in deleted_paths]
+        total_bytes = sum(size for _, _, size in remaining)
+        for _, path, size in sorted(remaining):
+            if total_bytes <= DIAGNOSTIC_RETENTION_MAX_BYTES:
+                break
+            try:
+                shutil.rmtree(path)
+                deleted += 1
+                total_bytes -= size
+                deleted_paths.add(path)
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+        return {
+            "deleted": deleted,
+            "kept": max(0, len(entries) - deleted),
+            "total_bytes": max(0, total_bytes),
+            "retention_days": DIAGNOSTIC_RETENTION_DAYS,
+            "retention_runs": DIAGNOSTIC_RETENTION_RUNS,
+            "retention_max_bytes": DIAGNOSTIC_RETENTION_MAX_BYTES,
+            "errors": errors,
+        }
+
+    @staticmethod
+    def _directory_size(path: str) -> int:
+        total = 0
+        for root, _, files in os.walk(path):
+            for name in files:
+                file_path = os.path.join(root, name)
+                try:
+                    total += os.path.getsize(file_path)
+                except OSError:
+                    continue
+        return total
 
     def _write_run_log(self, text: str) -> None:
         if not self.run_log_path:
