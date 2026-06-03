@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import queue
+import shutil
 import threading
 import traceback
 import time
@@ -40,6 +41,8 @@ APP_STATE_DIR = app_state_dir()
 LOGIN_PROFILE_DIR = os.path.join(APP_STATE_DIR, "login_profile")
 DEFAULT_COOKIE_PATH = os.path.join(APP_STATE_DIR, "jianyu_cookie.txt")
 DIAGNOSTICS_DIR = os.path.join(APP_STATE_DIR, "diagnostics")
+DIAGNOSTIC_RETENTION_DAYS = 14
+DIAGNOSTIC_RETENTION_RUNS = 30
 
 
 def playwright_channel_candidates() -> list[str | None]:
@@ -84,6 +87,7 @@ class JianyuDesktopApp:
         self.log_lock = threading.Lock()
         self.run_diag_dir = ""
         self.run_log_path = ""
+        self.last_heartbeat_log_at = 0.0
 
         self.province_var = tk.StringVar(value="西藏")
         self.days_var = tk.StringVar(value="30")
@@ -690,11 +694,42 @@ class JianyuDesktopApp:
         self._write_run_log(text)
 
     def _start_run_diagnostics(self) -> None:
+        cleanup_report = self._cleanup_old_diagnostics()
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.run_diag_dir = os.path.join(DIAGNOSTICS_DIR, stamp)
         os.makedirs(self.run_diag_dir, exist_ok=True)
         self.run_log_path = os.path.join(self.run_diag_dir, "run.log")
         self._write_run_log(f"[diag] start {stamp}\n")
+        self._write_run_log(f"[diag] dir {self.run_diag_dir}\n")
+        self._write_diag_event("diagnostic_cleanup", cleanup_report)
+
+    def _cleanup_old_diagnostics(self) -> dict:
+        if not os.path.isdir(DIAGNOSTICS_DIR):
+            return {"deleted": 0, "kept": 0, "errors": []}
+        now = time.time()
+        max_age_seconds = DIAGNOSTIC_RETENTION_DAYS * 24 * 60 * 60
+        entries: list[tuple[float, str]] = []
+        for name in os.listdir(DIAGNOSTICS_DIR):
+            path = os.path.join(DIAGNOSTICS_DIR, name)
+            if not os.path.isdir(path):
+                continue
+            try:
+                entries.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+        entries.sort(reverse=True)
+        deleted = 0
+        errors: list[str] = []
+        for index, (mtime, path) in enumerate(entries):
+            should_delete = index >= DIAGNOSTIC_RETENTION_RUNS or (now - mtime) > max_age_seconds
+            if not should_delete:
+                continue
+            try:
+                shutil.rmtree(path)
+                deleted += 1
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+        return {"deleted": deleted, "kept": max(0, len(entries) - deleted), "errors": errors}
 
     def _write_run_log(self, text: str) -> None:
         if not self.run_log_path:
@@ -702,6 +737,18 @@ class JianyuDesktopApp:
         with self.log_lock:
             with open(self.run_log_path, "a", encoding="utf-8") as fp:
                 fp.write(text)
+
+    def _write_diag_event(self, event: str, payload: dict | None = None) -> None:
+        if not self.run_diag_dir:
+            return
+        row = {
+            "time": datetime.now().isoformat(),
+            "event": event,
+            "payload": payload or {},
+        }
+        with self.log_lock:
+            with open(os.path.join(self.run_diag_dir, "events.jsonl"), "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _write_diag_json(self, name: str, payload: dict) -> None:
         if not self.run_diag_dir:
@@ -768,7 +815,7 @@ class JianyuDesktopApp:
                 try:
                     callback(*args)
                 except Exception:
-                    pass
+                    self._write_diag_event("ui_callback_error", {"traceback": traceback.format_exc()})
                 processed += 1
         except queue.Empty:
             pass
@@ -944,6 +991,18 @@ class JianyuDesktopApp:
         if auto_stopping:
             self.stop_flag = True
             self.status_var.set("长时间无进展，已自动停止并保存当前结果...")
+            self._write_diag_event(
+                "auto_stop_stale_progress",
+                {
+                    "stale_seconds": stale_seconds,
+                    "current_progress_base": self.current_progress_base,
+                    "progress_current": self.progress_current,
+                    "progress_total": self.progress_total,
+                    "search_page": self.search_page,
+                    "search_max_pages": self.search_max_pages,
+                    "ui_queue_size": self.ui_task_queue.qsize(),
+                },
+            )
         if auto_stopping:
             text = f"{text} | 超过 {self._format_eta(stale_seconds)} 无新进度，自动停止并保存"
         elif self.current_detail_started_at > 0:
@@ -954,6 +1013,26 @@ class JianyuDesktopApp:
             stale_elapsed = self._format_eta(stale_seconds)
             text = f"{text} | 距上次进度 {stale_elapsed}"
         self.progress_text_var.set(text)
+        if now - self.last_heartbeat_log_at >= 30:
+            self.last_heartbeat_log_at = now
+            self._write_diag_event(
+                "heartbeat",
+                {
+                    "status": self.status_var.get(),
+                    "progress_text": text,
+                    "progress_current": self.progress_current,
+                    "progress_total": self.progress_total,
+                    "search_page": self.search_page,
+                    "search_max_pages": self.search_max_pages,
+                    "collected_records": self.collected_records,
+                    "grouped_projects": self.grouped_projects,
+                    "core_projects": self.core_projects,
+                    "stale_seconds": stale_seconds,
+                    "captcha_waiting": self.captcha_waiting,
+                    "stop_flag": self.stop_flag,
+                    "ui_queue_size": self.ui_task_queue.qsize(),
+                },
+            )
         self.root.after(1000, self._tick_runtime_feedback)
 
     def _handle_progress_line(self, line: str) -> bool:
@@ -1522,7 +1601,21 @@ class JianyuDesktopApp:
                 "mode": run_mode,
             },
         )
+        self._write_diag_event(
+            "run_start",
+            {
+                "run_id": run_id,
+                "mode": run_mode,
+                "province": province,
+                "recent_days": recent_days,
+                "database_output": database_output,
+                "output": output,
+                "keep_browser_session": keep_browser_session,
+                "login_context_ready": self.login_context is not None,
+            },
+        )
         self._append_log(f"[模式] {run_mode}\n")
+        self._append_log(f"[诊断日志] {self.run_diag_dir}\n")
         self._append_log(f"[输出] 本次合并={output} | 数据库={database_output} | 剑鱼库={jianyu_database} | 全国库={ggzy_database}\n")
         self.run_started_at = time.time()
         self.progress_total = 0
@@ -1777,6 +1870,17 @@ class JianyuDesktopApp:
 
     def stop_capture(self) -> None:
         self.stop_flag = True
+        self._write_diag_event(
+            "manual_stop_requested",
+            {
+                "progress_current": self.progress_current,
+                "progress_total": self.progress_total,
+                "search_page": self.search_page,
+                "search_max_pages": self.search_max_pages,
+                "current_progress_base": self.current_progress_base,
+                "ui_queue_size": self.ui_task_queue.qsize(),
+            },
+        )
         self._append_log("\n[停止请求已发送]\n")
         self.status_var.set("正在停止...")
 
@@ -1798,6 +1902,23 @@ class JianyuDesktopApp:
                 "core_projects": self.core_projects,
                 "last_progress_at": self.last_progress_at,
                 "current_progress_base": self.current_progress_base,
+                "ui_queue_size": self.ui_task_queue.qsize(),
+            },
+        )
+        self._write_diag_event(
+            "run_finish",
+            {
+                "status": status,
+                "elapsed_seconds": elapsed,
+                "progress_total": self.progress_total,
+                "progress_current": self.progress_current,
+                "search_page": self.search_page,
+                "search_max_pages": self.search_max_pages,
+                "collected_records": self.collected_records,
+                "grouped_projects": self.grouped_projects,
+                "core_projects": self.core_projects,
+                "current_progress_base": self.current_progress_base,
+                "ui_queue_size": self.ui_task_queue.qsize(),
             },
         )
         if self.shutting_down:
