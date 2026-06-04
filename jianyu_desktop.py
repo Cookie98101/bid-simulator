@@ -722,7 +722,7 @@ class JianyuDesktopApp:
         deleted = 0
         deleted_paths: set[str] = set()
         errors: list[str] = []
-        for index, (mtime, path) in enumerate(entries):
+        for index, (mtime, path, _) in enumerate(entries):
             should_delete = index >= DIAGNOSTIC_RETENTION_RUNS or (now - mtime) > max_age_seconds
             if not should_delete:
                 continue
