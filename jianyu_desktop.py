@@ -69,6 +69,9 @@ class JianyuDesktopApp:
         self.login_context = None
         self.login_page = None
         self.worker_page = None
+        self.browser_task_queue: queue.Queue = queue.Queue()
+        self.browser_thread = None
+        self.browser_thread_id = None
         self.keep_browser_session_var = tk.BooleanVar(value=True)
         self.run_started_at = 0.0
         self.progress_total = 0
@@ -194,6 +197,8 @@ class JianyuDesktopApp:
         self.status_var.set("就绪：默认同时抓取剑鱼和全国公共资源，Cookie 只用于剑鱼。")
 
     def _launch_login_context(self) -> None:
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._launch_login_context)
         if self.shutting_down:
             raise RuntimeError("application is closing")
         if self.login_context is not None:
@@ -236,13 +241,15 @@ class JianyuDesktopApp:
 
     def _open_login_browser(self) -> None:
         try:
-            self._launch_login_context()
+            self._run_on_browser_thread_sync(self._launch_login_context)
             self.status_var.set("登录页已打开，请在浏览器里手动登录并完成验证码。")
             messagebox.showinfo("登录提示", "浏览器已打开。请先在网页里登录剑鱼并完成验证码，然后回到这里点“保存登录态”。")
         except Exception as exc:
             messagebox.showerror("打开失败", f"无法启动登录浏览器：{exc}")
 
     def _build_cookie_string(self) -> str:
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._build_cookie_string)
         if self.login_context is None:
             raise RuntimeError("登录浏览器尚未打开。")
         cookies = self.login_context.cookies()
@@ -266,20 +273,29 @@ class JianyuDesktopApp:
 
     def _save_login_state(self) -> None:
         try:
-            self._launch_login_context()
-            cookie_text = self._build_cookie_string()
+            self._run_on_browser_thread_sync(self._launch_login_context)
+            cookie_text = self._run_on_browser_thread_sync(self._build_cookie_string)
             cookie_path = self.cookie_var.get().strip() or DEFAULT_COOKIE_PATH
             with open(cookie_path, "w", encoding="utf-8") as fp:
                 fp.write(cookie_text)
             storage_path = f"{cookie_path}.json"
-            self.login_context.storage_state(path=storage_path)
+            self._run_on_browser_thread_sync(self._save_browser_storage_state, storage_path)
             self.cookie_var.set(cookie_path)
             self.status_var.set(f"登录态已保存：{cookie_path}")
             messagebox.showinfo("保存成功", f"登录态已保存。\nCookie: {cookie_path}\nStorage State: {storage_path}")
         except Exception as exc:
             messagebox.showerror("保存失败", f"无法保存登录态：{exc}")
 
+    def _save_browser_storage_state(self, storage_path: str) -> None:
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._save_browser_storage_state, storage_path)
+        if self.login_context is None:
+            raise RuntimeError("登录浏览器尚未打开。")
+        self.login_context.storage_state(path=storage_path)
+
     def _refresh_cookie_from_browser_if_possible(self) -> None:
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._refresh_cookie_from_browser_if_possible)
         if self.login_context is None:
             return
         try:
@@ -291,6 +307,8 @@ class JianyuDesktopApp:
             pass
 
     def _get_request_page(self):
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._get_request_page)
         if self.shutting_down:
             raise RuntimeError("application is closing")
         self._launch_login_context()
@@ -307,8 +325,8 @@ class JianyuDesktopApp:
         return self.worker_page
 
     def _browser_request(self, method: str, url: str, payload, headers: dict | None, expect: str):
-        if threading.get_ident() != self.main_thread_id:
-            return self._run_on_main_thread_sync(self._browser_request, method, url, payload, headers, expect)
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._browser_request, method, url, payload, headers, expect)
         page = self._get_request_page()
         js = """async ({ method, url, payload, headers, expect }) => {
             async function decryptJianyuPayload(data) {
@@ -504,10 +522,14 @@ class JianyuDesktopApp:
             raise
 
     def _browser_page_content(self, page, target_url: str) -> str:
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._browser_page_content, page, target_url)
         page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
         return page.content()
 
     def _browser_current_page_state(self, page) -> dict:
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._browser_current_page_state, page)
         try:
             current_url = page.url or ""
         except Exception:
@@ -519,8 +541,8 @@ class JianyuDesktopApp:
         return {"url": current_url, "html": html}
 
     def _browser_rendered_payload(self, url: str) -> dict:
-        if threading.get_ident() != self.main_thread_id:
-            return self._run_on_main_thread_sync(self._browser_rendered_payload, url)
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._browser_rendered_payload, url)
         page = self._get_request_page()
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         try:
@@ -559,6 +581,8 @@ class JianyuDesktopApp:
         return {"text": text, "tables": table_payload or []}
 
     def _bring_login_browser_to_front(self, target_url: str | None = None) -> None:
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._bring_login_browser_to_front, target_url)
         self._launch_login_context()
         page = self.login_page
         if page is None:
@@ -582,7 +606,7 @@ class JianyuDesktopApp:
             self.progress_text_var.set,
             f"检测到验证码，请在浏览器窗口完成验证。类型={payload.get('scope') or '-'}",
         )
-        self._run_on_main_thread_sync(self._bring_login_browser_to_front, target_url)
+        self._run_on_browser_thread_sync(self._bring_login_browser_to_front, target_url)
         while True:
             if self.stop_flag:
                 self.captcha_waiting = False
@@ -590,18 +614,18 @@ class JianyuDesktopApp:
             try:
                 page = self.login_page
                 if page is None:
-                    self._run_on_main_thread_sync(self._launch_login_context)
+                    self._run_on_browser_thread_sync(self._launch_login_context)
                     page = self.login_page
                 if page is None:
                     time.sleep(3)
                     continue
-                state = self._run_on_main_thread_sync(self._browser_current_page_state, page)
+                state = self._run_on_browser_thread_sync(self._browser_current_page_state, page)
                 current_url = str(state.get("url") or "")
                 html = str(state.get("html") or "")
                 if "antiVerify" not in html and "textVerify" not in html and "imgData" not in html:
                     self.captcha_waiting = False
-                    self._run_on_main_thread_sync(self._capture_page_debug, page, "manual_captcha_resolved_page", target_url)
-                    self._run_on_main_thread_sync(self._refresh_cookie_from_browser_if_possible)
+                    self._run_on_browser_thread_sync(self._capture_page_debug, page, "manual_captcha_resolved_page", target_url)
+                    self._run_on_browser_thread_sync(self._refresh_cookie_from_browser_if_possible)
                     if "/front/notFind" in current_url or "该页面信息不存在" in html:
                         self._run_on_main_thread_sync(
                             self.status_var.set,
@@ -794,6 +818,8 @@ class JianyuDesktopApp:
                 json.dump(payload, fp, ensure_ascii=False, indent=2)
 
     def _capture_page_debug(self, page, prefix: str, url: str = "") -> None:
+        if threading.get_ident() != self.browser_thread_id:
+            return self._run_on_browser_thread_sync(self._capture_page_debug, page, prefix, url)
         if not self.run_diag_dir:
             return
         safe_prefix = prefix.replace("/", "_")
@@ -822,6 +848,39 @@ class JianyuDesktopApp:
 
     def _enqueue_ui(self, callback, *args) -> None:
         self.ui_task_queue.put((callback, args))
+
+    def _ensure_browser_thread(self) -> None:
+        if self.browser_thread is not None and self.browser_thread.is_alive():
+            return
+        self.browser_task_queue = queue.Queue()
+        self.browser_thread = threading.Thread(target=self._browser_thread_loop, daemon=True)
+        self.browser_thread.start()
+
+    def _browser_thread_loop(self) -> None:
+        self.browser_thread_id = threading.get_ident()
+        while True:
+            item = self.browser_task_queue.get()
+            if item is None:
+                break
+            callback, args, result_queue = item
+            try:
+                result_queue.put((True, callback(*args)))
+            except Exception as exc:
+                result_queue.put((False, exc))
+        self.browser_thread_id = None
+
+    def _run_on_browser_thread_sync(self, callback, *args, allow_shutdown: bool = False):
+        if threading.get_ident() == self.browser_thread_id:
+            return callback(*args)
+        if self.shutting_down and not allow_shutdown:
+            raise RuntimeError("application is closing")
+        self._ensure_browser_thread()
+        result_queue: queue.Queue = queue.Queue(maxsize=1)
+        self.browser_task_queue.put((callback, args, result_queue))
+        ok, value = result_queue.get()
+        if ok:
+            return value
+        raise value
 
     def _run_on_main_thread_sync(self, callback, *args):
         if threading.get_ident() == self.main_thread_id:
@@ -1972,6 +2031,17 @@ class JianyuDesktopApp:
             self.progress_text_var.set(status)
 
     def _close_login_browser(self) -> None:
+        if threading.get_ident() != self.browser_thread_id:
+            if self.browser_thread is None or not self.browser_thread.is_alive():
+                return
+            try:
+                self._run_on_browser_thread_sync(self._close_login_browser, allow_shutdown=True)
+            finally:
+                self.browser_task_queue.put(None)
+                self.browser_thread.join(timeout=5)
+                self.browser_thread = None
+                self.browser_thread_id = None
+            return
         if self.login_context is not None:
             try:
                 self.login_context.close()
@@ -1988,10 +2058,10 @@ class JianyuDesktopApp:
         self.playwright = None
 
     def _on_close(self) -> None:
-        self.shutting_down = True
         self.stop_flag = True
         collector.STOP_REQUESTED = lambda: True
         ggzy_collector.STOP_REQUESTED = lambda: True
+        self.shutting_down = True
         self._close_login_browser()
         self.root.destroy()
 
