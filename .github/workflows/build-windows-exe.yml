@@ -32,12 +32,13 @@ jobs:
             scikit-learn `
             cryptography `
             requests `
-            beautifulsoup4
+            beautifulsoup4 `
+            openpyxl
 
       - name: Smoke Test Python Imports
         shell: pwsh
         run: |
-          python -c "import requests, bs4, cryptography, cv2, numpy, sklearn, playwright; import ggzy_gov_collector; import jianyu_project_collector; import jianyu_desktop; print('python import smoke test passed')"
+          python -c "import requests, bs4, cryptography, cv2, numpy, sklearn, playwright, openpyxl; import ggzy_gov_collector; import jianyu_project_collector; import jianyu_desktop; import project_excel_analyzer; print('python import smoke test passed')"
 
       - name: Install Playwright Browsers
         shell: pwsh
@@ -89,6 +90,18 @@ jobs:
             --hidden-import numpy `
             jianyu_desktop.py
 
+      - name: Build Project Excel Analyzer EXE
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --onefile `
+            --windowed `
+            --name project_excel_analyzer `
+            --collect-all openpyxl `
+            --hidden-import openpyxl `
+            project_excel_analyzer.py
+
       - name: Smoke Test Built EXEs
         shell: pwsh
         run: |
@@ -106,6 +119,13 @@ jobs:
           }
           Stop-Process -Id $jianyu.Id -Force
 
+          $analyzer = Start-Process -FilePath "dist/project_excel_analyzer.exe" -PassThru
+          Start-Sleep -Seconds 8
+          if ($analyzer.HasExited) {
+            throw "project_excel_analyzer.exe exited during startup. Check packaging/runtime dependencies."
+          }
+          Stop-Process -Id $analyzer.Id -Force
+
       - name: Package Jianyu Desktop Folder
         shell: pwsh
         run: |
@@ -122,3 +142,9 @@ jobs:
         with:
           name: jianyu-desktop-windows
           path: dist/jianyu_desktop_windows.zip
+
+      - name: Upload Project Excel Analyzer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-excel-analyzer-windows
+          path: dist/project_excel_analyzer.exe

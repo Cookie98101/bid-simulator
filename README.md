@@ -40,11 +40,47 @@ python bid_simulator.py --cli --simulations 1000
 
 - `bid-simulator-windows`
 - `jianyu-desktop-windows`
+- `project-excel-analyzer-windows`
 
 运行方式：
 
 - `bid_simulator.exe`
 - `jianyu-desktop-windows` 产物是一个 zip，解压后运行其中的 `jianyu_desktop.exe`
+- `project_excel_analyzer.exe`
+
+## 项目报价 Excel 分析器
+
+脚本文件：
+
+- `project_excel_analyzer.py`
+
+用途：
+
+- 批量读取一个或多个项目报价 Excel
+- 每个项目提取控制价、中标价、各单位报价、项目参与竞争家数
+- 计算每个项目的中标下浮率、各单位报价下浮率
+- 按控制价档位统计：
+  - 小于 1000 万
+  - 1000 万-2000 万
+  - 2000 万-5000 万
+  - 5000 万-1 亿
+  - 1 亿及以上
+- 汇总所有历史项目的：
+  - 报价最高下浮率、最低下浮率、平均下浮率
+  - 中标价最高下浮率、最低下浮率、平均下浮率
+  - 项目参与竞争家数最高、最低、平均
+
+桌面界面：
+
+```bash
+python project_excel_analyzer.py
+```
+
+命令行示例：
+
+```bash
+python project_excel_analyzer.py ./项目Excel文件夹 -o 项目报价分析.xlsx
+```
 
 ## 剑鱼标讯项目采集
 
