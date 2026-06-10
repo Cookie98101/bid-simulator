@@ -136,6 +136,27 @@ def calc_down_rate(control_price: float | None, amount: float | None) -> float |
     return (control_price - amount) / control_price * 100.0
 
 
+def infer_control_price_from_quotes(bid_rows: list[BidRow]) -> float | None:
+    inferred: list[float] = []
+    for row in bid_rows:
+        if row.quote is None or row.down_rate is None:
+            continue
+        denominator = 1.0 - row.down_rate / 100.0
+        if denominator <= 0:
+            continue
+        value = row.quote / denominator
+        if value > 0 and math.isfinite(value):
+            inferred.append(value)
+    if not inferred:
+        return None
+    inferred.sort()
+    median = inferred[len(inferred) // 2]
+    consistent = [value for value in inferred if abs(value - median) <= max(1.0, median * 0.001)]
+    if len(consistent) < max(1, len(inferred) // 2):
+        return None
+    return sum(consistent) / len(consistent)
+
+
 def control_bucket(control_price: float | None) -> str:
     if control_price is None:
         return "控制价缺失"
@@ -190,7 +211,11 @@ def map_header_values(headers: list[str], values: list[Any]) -> dict[str, Any]:
 def get_first(mapped: dict[str, Any], aliases: tuple[str, ...]) -> Any:
     for alias in aliases:
         for key, value in mapped.items():
-            if alias == key or alias in key:
+            if alias == key:
+                return value
+    for alias in aliases:
+        for key, value in mapped.items():
+            if alias in key:
                 return value
     return None
 
@@ -276,6 +301,14 @@ def parse_project_sheet(path: Path, ws) -> ProjectRecord | None:
             quote_text = clean_text(ws.cell(row_index, quote_text_col).value if quote_text_col else "")
             project.bid_rows.append(BidRow(company=company, quote=quote, down_rate=down_rate, duration=duration, quote_text=quote_text))
 
+    if project.control_price is None:
+        inferred_control = infer_control_price_from_quotes(project.bid_rows)
+        if inferred_control is not None:
+            project.control_price = inferred_control
+    for row in project.bid_rows:
+        if row.down_rate is None:
+            row.down_rate = calc_down_rate(project.control_price, row.quote)
+
     project.bid_rows.sort(key=lambda item: (-999999.0 if item.down_rate is None else -item.down_rate, item.company))
     infer_winner(project)
     validate_project(project)
@@ -293,16 +326,19 @@ def parse_project_file(path: Path) -> list[ProjectRecord]:
 
 
 def collect_input_files(paths: list[str]) -> list[Path]:
+    def should_skip(item: Path) -> bool:
+        return item.name.startswith("~$")
+
     files: list[Path] = []
     for raw_path in paths:
         path = Path(raw_path).expanduser()
         if path.is_dir():
             for item in sorted(path.rglob("*")):
-                if item.name.startswith("~$"):
+                if should_skip(item):
                     continue
                 if item.suffix.lower() in SUPPORTED_EXTENSIONS:
                     files.append(item)
-        elif path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS and not path.name.startswith("~$"):
+        elif path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS and not should_skip(path):
             files.append(path)
     seen: set[str] = set()
     unique: list[Path] = []
@@ -351,6 +387,13 @@ def rate_fmt(value: float | None) -> float | None:
     return None if value is None else round(float(value), 4)
 
 
+def winning_rate_summary_fmt(analysis: dict[str, Any], key: str) -> float | str:
+    winning_stats = analysis["中标下浮率统计"]
+    if winning_stats["样本数"] == 0:
+        return "缺中标价数据"
+    return rate_fmt(winning_stats[key])
+
+
 def set_common_style(ws) -> None:
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
@@ -394,9 +437,9 @@ def create_output_workbook(projects: list[ProjectRecord], output_path: Path) -> 
         ["报价最高下浮率", rate_fmt(analysis["报价下浮率统计"]["最高"]), "所有投标报价下浮率中的最高值"],
         ["报价最低下浮率", rate_fmt(analysis["报价下浮率统计"]["最低"]), "所有投标报价下浮率中的最低值"],
         ["报价平均下浮率", rate_fmt(analysis["报价下浮率统计"]["平均"]), "所有投标报价下浮率的平均值"],
-        ["中标最高下浮率", rate_fmt(analysis["中标下浮率统计"]["最高"]), "所有项目中标价下浮率最高值"],
-        ["中标最低下浮率", rate_fmt(analysis["中标下浮率统计"]["最低"]), "所有项目中标价下浮率最低值"],
-        ["中标平均下浮率", rate_fmt(analysis["中标下浮率统计"]["平均"]), "所有项目中标价下浮率平均值"],
+        ["中标最高下浮率", winning_rate_summary_fmt(analysis, "最高"), "所有项目中标价下浮率最高值；输入缺中标价时无法计算"],
+        ["中标最低下浮率", winning_rate_summary_fmt(analysis, "最低"), "所有项目中标价下浮率最低值；输入缺中标价时无法计算"],
+        ["中标平均下浮率", winning_rate_summary_fmt(analysis, "平均"), "所有项目中标价下浮率平均值；输入缺中标价时无法计算"],
         ["项目参与竞争家数最高", analysis["项目参与竞争家数统计"]["最高"], "按每个项目有效报价家数统计"],
         ["项目参与竞争家数最低", analysis["项目参与竞争家数统计"]["最低"], "按每个项目有效报价家数统计"],
         ["项目参与竞争家数平均", round(analysis["项目参与竞争家数统计"]["平均"], 2) if analysis["项目参与竞争家数统计"]["平均"] is not None else None, "按每个项目有效报价家数统计"],
@@ -495,6 +538,22 @@ def default_output_path() -> Path:
     return base / f"项目报价分析_{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
 
 
+def timestamped_output_path(path: Path) -> Path:
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    if re.search(r"_\d{8}-\d{6}$", path.stem):
+        candidate = path
+    else:
+        candidate = path.with_name(f"{path.stem}_{timestamp}{path.suffix or '.xlsx'}")
+    if not candidate.exists():
+        return candidate
+    index = 2
+    while True:
+        next_candidate = candidate.with_name(f"{candidate.stem}_{index}{candidate.suffix}")
+        if not next_candidate.exists():
+            return next_candidate
+        index += 1
+
+
 def run_analysis(input_paths: list[str], output_path: str | None = None) -> tuple[Path, list[ProjectRecord]]:
     files = collect_input_files(input_paths)
     if not files:
@@ -514,7 +573,7 @@ def run_analysis(input_paths: list[str], output_path: str | None = None) -> tupl
         raise RuntimeError("没有成功识别任何项目。\n" + "\n".join(parse_errors[:20]))
     for error in parse_errors:
         projects.append(ProjectRecord(source_file=error, sheet_name="", project_name="未识别文件", issues=[error]))
-    output = Path(output_path).expanduser() if output_path else default_output_path()
+    output = timestamped_output_path(Path(output_path).expanduser()) if output_path else default_output_path()
     create_output_workbook(projects, output)
     return output, projects
 
@@ -608,6 +667,7 @@ class AnalyzerApp:
     def analysis_done(self, output: Path, projects: list[ProjectRecord]) -> None:
         self.running = False
         self.append_log(f"完成：识别项目 {len(projects)} 个。\n输出：{output}\n")
+        self.output_var.set(str(default_output_path()))
         messagebox.showinfo("完成", f"分析完成。\n识别项目：{len(projects)} 个\n输出：{output}")
 
     def analysis_failed(self, exc: Exception, detail: str) -> None:
